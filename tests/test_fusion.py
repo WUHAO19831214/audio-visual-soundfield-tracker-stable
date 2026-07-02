@@ -1,4 +1,7 @@
-from src.fusion import FUSED_FIELDS, fuse_records
+import json
+from pathlib import Path
+
+from src.fusion import FUSED_FIELDS, SynchronizedCaptureSession, fuse_records
 
 
 def audio_row(timestamp: float) -> dict:
@@ -59,3 +62,27 @@ def test_audio_row_is_unmatched_after_threshold() -> None:
     assert fused[0]["track_id"] == ""
     assert fused[0]["time_diff_sec"] == 0.151
 
+
+def test_finalize_summary_marks_zero_audio_as_not_ok(tmp_path: Path) -> None:
+    session = SynchronizedCaptureSession(output_dir=tmp_path)
+    session.add_visual_track(
+        1.0,
+        {
+            "track_id": 1,
+            "center_x": 10,
+            "center_y": 20,
+            "bbox_width": 30,
+            "bbox_height": 40,
+        },
+    )
+
+    artifacts = session.finalize(
+        prefix="capture_test",
+        export_acoustic_trajectory=False,
+    )
+    summary = json.loads(artifacts.summary_json.read_text(encoding="utf-8"))
+
+    assert summary["ok"] is False
+    assert summary["video_sample_count"] == 1
+    assert summary["audio_sample_count"] == 0
+    assert "不可信" in summary["warning"]

@@ -29,6 +29,167 @@ def check_writable_directory(path: str | Path) -> tuple[bool, str]:
         return False, f"{directory}: {exc}"
 
 
+def _level_from_samples(samples: np.ndarray) -> tuple[float, float]:
+    values = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        return 0.0, -120.0
+    rms = float(np.sqrt(np.mean(values**2)))
+    db = 20.0 * math.log10(max(rms, 1e-12))
+    return rms, db
+
+
+class SoundDeviceCapture:
+    """A small stateful sounddevice InputStream wrapper used by capture modes."""
+
+    def __init__(
+        self,
+        audio_device_index: int | None,
+        session: SynchronizedCaptureSession,
+    ) -> None:
+        self.audio_device_index = audio_device_index
+        self.session = session
+        self._audio_stream = None
+        self._audio_sample_rate = 48_000
+        self._ready_event = threading.Event()
+        self._lock = threading.RLock()
+        self._state = {
+            "is_running": False,
+            "stream_started": False,
+            "receiving": False,
+            "started_at": None,
+            "last_chunk_at": None,
+            "chunk_count": 0,
+            "last_rms": 0.0,
+            "last_db": -120.0,
+            "last_error": "",
+            "device_index": audio_device_index,
+            "device_name": "",
+            "sample_rate": 0,
+            "channels": 0,
+        }
+
+    @property
+    def running(self) -> bool:
+        return bool(self._audio_stream is not None)
+
+    @property
+    def audio_error(self) -> str:
+        with self._lock:
+            return str(self._state.get("last_error", ""))
+
+    def start(self, require_ready: bool = False, timeout_sec: float = 2.0) -> None:
+        if self.running:
+            if require_ready and not self.wait_until_ready(timeout_sec):
+                raise RuntimeError("音频流已启动，但未收到音频 chunk")
+            return
+        self._ready_event.clear()
+        try:
+            device = check_audio_input_device(self.audio_device_index)
+            import sounddevice as sd
+
+            block_size = max(1, int(device["sample_rate"] * 0.1))
+            self._audio_sample_rate = int(device["sample_rate"])
+            with self._lock:
+                self._state.update(
+                    is_running=False,
+                    stream_started=False,
+                    receiving=False,
+                    started_at=time.time(),
+                    last_chunk_at=None,
+                    chunk_count=0,
+                    last_rms=0.0,
+                    last_db=-120.0,
+                    last_error="",
+                    device_index=device["index"],
+                    device_name=device["name"],
+                    sample_rate=self._audio_sample_rate,
+                    channels=device["channels"],
+                )
+            self.session.set_audio_device_info(self.status())
+            self._audio_stream = sd.InputStream(
+                device=device["index"],
+                channels=1,
+                samplerate=self._audio_sample_rate,
+                blocksize=block_size,
+                dtype="float32",
+                callback=self._audio_callback,
+            )
+            self._audio_stream.start()
+            with self._lock:
+                self._state.update(is_running=True, stream_started=True)
+            self.session.set_audio_device_info(self.status())
+            if require_ready and not self.wait_until_ready(timeout_sec):
+                self.stop()
+                raise RuntimeError(
+                    "麦克风设备已选择，但正式采集未收到音频数据，请重新测试麦克风或切换设备。"
+                )
+        except Exception as exc:
+            self._set_error(str(exc))
+            self.stop()
+            raise
+
+    def _set_error(self, error: str) -> None:
+        with self._lock:
+            self._state["last_error"] = error
+        self.session.set_audio_error(error)
+        self.session.set_audio_device_info(self.status())
+
+    def _audio_callback(self, indata, frames, time_info, status) -> None:
+        if status:
+            self._set_error(str(status))
+        chunk = np.asarray(indata).copy()
+        rms, db = _level_from_samples(chunk)
+        with self._lock:
+            self._state.update(
+                receiving=True,
+                last_chunk_at=time.time(),
+                chunk_count=int(self._state["chunk_count"]) + 1,
+                last_rms=rms,
+                last_db=db,
+            )
+        self._ready_event.set()
+        self.session.set_audio_device_info(self.status())
+        self.session.audio_recorder.add_samples(chunk, int(self._audio_sample_rate))
+
+    def wait_until_ready(self, timeout_sec: float = 2.0) -> bool:
+        return self._ready_event.wait(timeout=max(0.0, timeout_sec))
+
+    def status(self) -> dict:
+        with self._lock:
+            state = self._state.copy()
+        state["audio_device_index"] = state.get("device_index")
+        state["audio_device_name"] = state.get("device_name")
+        return state
+
+    def reset(self) -> None:
+        self.stop()
+        self._ready_event.clear()
+        with self._lock:
+            self._state.update(
+                is_running=False,
+                stream_started=False,
+                receiving=False,
+                started_at=None,
+                last_chunk_at=None,
+                chunk_count=0,
+                last_rms=0.0,
+                last_db=-120.0,
+                last_error="",
+            )
+
+    def stop(self) -> None:
+        if self._audio_stream is not None:
+            try:
+                self._audio_stream.stop()
+                self._audio_stream.close()
+            finally:
+                self._audio_stream = None
+        with self._lock:
+            self._state["is_running"] = False
+            self._state["stream_started"] = False
+        self.session.set_audio_device_info(self.status())
+
+
 class LocalCameraWorker:
     def __init__(
         self,
@@ -132,36 +293,19 @@ class LocalFusionWorker(LocalCameraWorker):
         super().__init__(camera_index, confidence_threshold, person_only)
         self.audio_device_index = audio_device_index
         self.session = SynchronizedCaptureSession(output_dir=output_dir)
-        self._audio_stream = None
-        self._audio_sample_rate = 48_000
-        self.audio_error = ""
+        self.audio_capture = SoundDeviceCapture(audio_device_index, self.session)
+
+    @property
+    def audio_error(self) -> str:
+        return self.audio_capture.audio_error
 
     def start(self) -> None:
-        super().start()
         try:
-            device = check_audio_input_device(self.audio_device_index)
-            import sounddevice as sd
-
-            block_size = max(1, int(device["sample_rate"] * 0.1))
-            self._audio_sample_rate = device["sample_rate"]
-            self._audio_stream = sd.InputStream(
-                device=self.audio_device_index,
-                channels=1,
-                samplerate=device["sample_rate"],
-                blocksize=block_size,
-                dtype="float32",
-                callback=self._audio_callback,
-            )
-            self._audio_stream.start()
-        except Exception as exc:
-            self.audio_error = str(exc)
-
-    def _audio_callback(self, indata, frames, time_info, status) -> None:
-        if status:
-            self.audio_error = str(status)
-        self.session.audio_recorder.add_samples(
-            np.asarray(indata).copy(), int(self._audio_sample_rate)
-        )
+            self.audio_capture.start(require_ready=True, timeout_sec=2.0)
+            super().start()
+        except Exception:
+            self.audio_capture.stop()
+            raise
 
     def _run(self) -> None:
         failed_reads = 0
@@ -199,20 +343,17 @@ class LocalFusionWorker(LocalCameraWorker):
     def status(self) -> dict:
         result = super().status()
         result.update(self.session.status())
-        result["audio_error"] = self.audio_error
+        audio_status = self.audio_capture.status()
+        result["audio_capture"] = audio_status
+        result["audio_error"] = audio_status.get("last_error", "")
         return result
 
-    def stop_and_finalize(self) -> CaptureArtifacts:
+    def stop_and_finalize(self, **finalize_options) -> CaptureArtifacts:
         self.stop()
-        return self.session.finalize()
+        return self.session.finalize(**finalize_options)
 
     def stop(self) -> None:
-        if self._audio_stream is not None:
-            try:
-                self._audio_stream.stop()
-                self._audio_stream.close()
-            finally:
-                self._audio_stream = None
+        self.audio_capture.stop()
         super().stop()
 
 
@@ -226,49 +367,24 @@ class LocalAudioWorker:
     ) -> None:
         self.audio_device_index = audio_device_index
         self.session = session
-        self._audio_stream = None
-        self._audio_sample_rate = 48_000
-        self.audio_error = ""
+        self.audio_capture = SoundDeviceCapture(audio_device_index, session)
 
     @property
     def running(self) -> bool:
-        return self._audio_stream is not None
+        return self.audio_capture.running
 
-    def start(self) -> None:
-        if self.running:
-            return
-        try:
-            device = check_audio_input_device(self.audio_device_index)
-            import sounddevice as sd
+    @property
+    def audio_error(self) -> str:
+        return self.audio_capture.audio_error
 
-            block_size = max(1, int(device["sample_rate"] * 0.1))
-            self._audio_sample_rate = device["sample_rate"]
-            self._audio_stream = sd.InputStream(
-                device=self.audio_device_index,
-                channels=1,
-                samplerate=device["sample_rate"],
-                blocksize=block_size,
-                dtype="float32",
-                callback=self._audio_callback,
-            )
-            self._audio_stream.start()
-        except Exception as exc:
-            self.audio_error = str(exc)
+    def start(self, require_ready: bool = False, timeout_sec: float = 2.0) -> None:
+        self.audio_capture.start(require_ready=require_ready, timeout_sec=timeout_sec)
 
-    def _audio_callback(self, indata, frames, time_info, status) -> None:
-        if status:
-            self.audio_error = str(status)
-        self.session.audio_recorder.add_samples(
-            np.asarray(indata).copy(), int(self._audio_sample_rate)
-        )
+    def status(self) -> dict:
+        return self.audio_capture.status()
 
     def stop(self) -> None:
-        if self._audio_stream is not None:
-            try:
-                self._audio_stream.stop()
-                self._audio_stream.close()
-            finally:
-                self._audio_stream = None
+        self.audio_capture.stop()
 
 
 class AudioLevelWorker:

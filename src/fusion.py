@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import json
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -116,6 +117,15 @@ class CaptureArtifacts:
     trajectory_plot: Path | None
     intensity_plot: Path | None
     frequency_plot: Path | None
+    trajectory_overlay_plot: Path | None = None
+    acoustic_db_values_plot: Path | None = None
+    acoustic_db_colormap_plot: Path | None = None
+    acoustic_frequency_values_plot: Path | None = None
+    acoustic_frequency_colormap_plot: Path | None = None
+    acoustic_spectral_centroid_colormap_plot: Path | None = None
+    acoustic_video: Path | None = None
+    summary_json: Path | None = None
+    summary: dict | None = None
 
 
 class SynchronizedCaptureSession:
@@ -133,6 +143,8 @@ class SynchronizedCaptureSession:
         self._audio_records: list[dict] = []
         self._latest_visual: dict | None = None
         self._latest_audio: dict | None = None
+        self._audio_device_info: dict = {}
+        self._audio_error = ""
         self.finalized = False
         self.artifacts: CaptureArtifacts | None = None
         self.audio_recorder = AudioRecorder(
@@ -163,6 +175,14 @@ class SynchronizedCaptureSession:
             self._audio_records.append(normalized)
             self._latest_audio = normalized
 
+    def set_audio_device_info(self, info: Mapping) -> None:
+        with self._lock:
+            self._audio_device_info = dict(info)
+
+    def set_audio_error(self, error: str) -> None:
+        with self._lock:
+            self._audio_error = str(error)
+
     def visual_snapshot(self) -> list[dict]:
         with self._lock:
             return [row.copy() for row in self._visual_records]
@@ -179,9 +199,16 @@ class SynchronizedCaptureSession:
                 "visual_samples": len(self._visual_records),
                 "audio_samples": len(self._audio_records),
                 "elapsed_sec": self.clock.elapsed(),
+                "audio_device": self._audio_device_info.copy(),
+                "audio_error": self._audio_error,
             }
 
-    def finalize(self, prefix: str | None = None) -> CaptureArtifacts:
+    def finalize(
+        self,
+        prefix: str | None = None,
+        export_acoustic_trajectory: bool = True,
+        acoustic_label_every: int = 10,
+    ) -> CaptureArtifacts:
         """Freeze current data, export raw/fused CSV files, and make plots."""
         with self._lock:
             if self.artifacts is not None:
@@ -197,11 +224,15 @@ class SynchronizedCaptureSession:
         audio_path = write_csv(
             self.output_dir / f"{stem}_audio.csv", AUDIO_FIELDS, audio
         )
+        fused = fuse_records(visual, audio)
         fused_path = write_csv(
             self.output_dir / f"{stem}_fused.csv",
             FUSED_FIELDS,
-            fuse_records(visual, audio),
+            fused,
         )
+        with self._lock:
+            audio_device_info = self._audio_device_info.copy()
+            audio_error = self._audio_error
 
         from .soundfield_visualizer import (
             plot_frequency_map,
@@ -212,6 +243,80 @@ class SynchronizedCaptureSession:
         trajectory = plot_trajectory(fused_path)
         intensity = plot_sound_intensity_map(fused_path)
         frequency = plot_frequency_map(fused_path)
+        trajectory_overlay = None
+        acoustic_db_values = None
+        acoustic_db_colormap = None
+        acoustic_frequency_values = None
+        acoustic_frequency_colormap = None
+        acoustic_spectral_centroid_colormap = None
+
+        if export_acoustic_trajectory:
+            from .acoustic_trajectory_visualizer import (
+                save_acoustic_trajectory_colormap,
+                save_acoustic_trajectory_values,
+            )
+            from .trajectory_visualizer import (
+                build_track_history_from_csv,
+                choose_main_track,
+                save_trajectory_blank,
+            )
+
+            track_history = build_track_history_from_csv(fused_path)
+            main_track_id = choose_main_track(track_history)
+            trajectory_overlay = save_trajectory_blank(
+                track_history,
+                self.output_dir / f"{stem}_fused_trajectory_overlay.png",
+                image_size=None,
+                main_track_id=main_track_id,
+                show_all_tracks=True,
+            )
+            acoustic_db_values = save_acoustic_trajectory_values(
+                fused_path,
+                self.output_dir / f"{stem}_acoustic_trajectory_db_values.png",
+                metric="db",
+                label_every=acoustic_label_every,
+            )
+            acoustic_db_colormap = save_acoustic_trajectory_colormap(
+                fused_path,
+                self.output_dir / f"{stem}_acoustic_trajectory_db_colormap.png",
+                metric="db",
+            )
+            acoustic_frequency_values = save_acoustic_trajectory_values(
+                fused_path,
+                self.output_dir / f"{stem}_acoustic_trajectory_frequency_values.png",
+                metric="dominant_frequency_hz",
+                label_every=acoustic_label_every,
+            )
+            acoustic_frequency_colormap = save_acoustic_trajectory_colormap(
+                fused_path,
+                self.output_dir / f"{stem}_acoustic_trajectory_frequency_colormap.png",
+                metric="dominant_frequency_hz",
+            )
+            acoustic_spectral_centroid_colormap = save_acoustic_trajectory_colormap(
+                fused_path,
+                self.output_dir
+                / f"{stem}_acoustic_trajectory_spectral_centroid_colormap.png",
+                metric="spectral_centroid_hz",
+            )
+
+        summary = {
+            "ok": bool(visual and audio and fused),
+            "warning": "" if visual and audio and fused else "采集样本不足，结果不可信",
+            "video_sample_count": len(visual),
+            "audio_sample_count": len(audio),
+            "fused_sample_count": len(fused),
+            "audio_device_index": audio_device_info.get("index", ""),
+            "audio_device_name": audio_device_info.get("name", ""),
+            "audio_sample_rate": audio_device_info.get("sample_rate", ""),
+            "audio_started_at": audio_device_info.get("started_at", ""),
+            "audio_last_chunk_at": audio_device_info.get("last_chunk_at", ""),
+            "audio_error": audio_error or audio_device_info.get("last_error", ""),
+        }
+        summary_path = self.output_dir / f"{stem}_summary.json"
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         artifacts = CaptureArtifacts(
             fused_csv=fused_path,
@@ -220,6 +325,14 @@ class SynchronizedCaptureSession:
             trajectory_plot=trajectory,
             intensity_plot=intensity,
             frequency_plot=frequency,
+            trajectory_overlay_plot=trajectory_overlay,
+            acoustic_db_values_plot=acoustic_db_values,
+            acoustic_db_colormap_plot=acoustic_db_colormap,
+            acoustic_frequency_values_plot=acoustic_frequency_values,
+            acoustic_frequency_colormap_plot=acoustic_frequency_colormap,
+            acoustic_spectral_centroid_colormap_plot=acoustic_spectral_centroid_colormap,
+            summary_json=summary_path,
+            summary=summary,
         )
         with self._lock:
             self.artifacts = artifacts
