@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from datetime import datetime
@@ -24,6 +25,8 @@ from src.csv_logger import write_csv
 from src.detector import Detector
 from src.fusion import SynchronizedCaptureSession
 from src.local_capture import (
+    AudioLevelWorker,
+    LocalAudioWorker,
     LocalCameraWorker,
     LocalFusionWorker,
     check_writable_directory,
@@ -199,21 +202,37 @@ def video_counting_mode(confidence_threshold: float, person_only: bool) -> None:
 
 def _camera_index_controls(prefix: str) -> int:
     scan_key = f"{prefix}_camera_scan"
-    if st.button("扫描本机摄像头 0–5", key=f"{prefix}_scan_button"):
+    if scan_key not in st.session_state:
+        with st.spinner("正在读取本机摄像头列表..."):
+            st.session_state[scan_key] = list_available_cameras(max_index=5)
+
+    st.markdown("**本机 OpenCV 摄像头**")
+    st.caption(
+        "Mac 内置摄像头通常是 Camera 0；iPhone Continuity Camera 更推荐用上面的浏览器模式。"
+    )
+    if st.button("刷新本机摄像头列表", key=f"{prefix}_scan_button"):
         with st.spinner("正在逐个测试摄像头编号..."):
             st.session_state[scan_key] = list_available_cameras(max_index=5)
 
     devices = st.session_state.get(scan_key, [])
     names = {item["index"]: item["name"] for item in devices}
+    available_indexes = [item["index"] for item in devices]
+    options = available_indexes or list(range(6))
     camera_index = st.selectbox(
         "摄像头 index",
-        options=list(range(6)),
-        format_func=lambda index: names.get(index, f"Camera {index}（未扫描/未确认）"),
+        options=options,
+        format_func=lambda index: (
+            f"{names.get(index, f'Camera {index}')}（可用）"
+            if index in available_indexes
+            else f"Camera {index}（未确认）"
+        ),
         key=f"{prefix}_camera_index",
     )
     if devices:
-        st.caption("扫描到：" + "、".join(item["name"] for item in devices))
-    if st.button("测试摄像头并读取一帧", key=f"{prefix}_test_button"):
+        st.success("可用摄像头：" + "、".join(item["name"] for item in devices))
+    else:
+        st.warning("暂未确认可用 OpenCV 摄像头。请检查 macOS 摄像头权限后点“刷新本机摄像头列表”。")
+    if st.button("读取一帧预览", key=f"{prefix}_test_button"):
         try:
             frame = read_camera_preview(int(camera_index))
             st.session_state[f"{prefix}_preview"] = cv2.cvtColor(
@@ -369,25 +388,31 @@ def _browser_fusion_capture(
 ) -> None:
     from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
-    from src.browser_capture import FusionAudioProcessor, FusionVideoProcessor
+    from src.browser_capture import FusionVideoProcessor
 
-    st.info(
-        "如果要使用 iPhone Continuity Camera，请先允许浏览器访问默认摄像头和麦克风，"
-        "停止后点击 Select Device，在浏览器设备列表中选择 iPhone。"
-    )
-    with st.expander("浏览器设备列表排查"):
+    st.info("iPhone/Continuity Camera 用这条路径：浏览器选摄像头，本页选麦克风。")
+    with st.expander("看不到 iPhone 摄像头？"):
         st.markdown(
-            "- 使用最新版 Chrome 或 Safari，并通过 `localhost` 打开本项目。\n"
-            "- 在地址栏权限中允许摄像头和麦克风，然后刷新页面。\n"
-            "- 先让默认设备成功启动，浏览器才会显示完整设备名称。\n"
-            "- 确认同一 Apple ID、Wi-Fi、蓝牙和接力均已开启。\n"
-            "- 浏览器设备列表由浏览器权限控制，需授权后由 WebRTC 组件显示。"
+            "- 先点 WebRTC 组件里的 `Start`，允许浏览器摄像头权限。\n"
+            "- 再点 `Select Device`，从浏览器设备列表里选 iPhone。\n"
+            "- 如果列表没有 iPhone，确认同一 Apple ID、Wi-Fi、蓝牙和接力已开启，然后刷新页面。"
         )
     reset_key = "fusion_browser_device_reset"
-    if st.button("重置浏览器音视频设备选择", key="reset_browser_fusion"):
+    if st.button("重置浏览器摄像头选择", key="reset_browser_fusion"):
         st.session_state[reset_key] = st.session_state.get(reset_key, 0) + 1
-        st.info("已清除本页面使用的旧设备选择。请重新点击 Start 并授权。")
+        st.info("已清除本页面使用的旧摄像头选择。请重新点击 Start 并授权。")
     component_generation = st.session_state.get(reset_key, 0)
+
+    st.markdown("**切换路径**")
+    st.markdown(
+        "1. 点击下方 WebRTC 组件的 **Start**。\n"
+        "2. 点击组件里的 **Select Device**，选择 iPhone 或其他浏览器可见摄像头。\n"
+        "3. 麦克风在下面选择，推荐 `Wireless Mic Rx` 或系统默认麦克风。"
+    )
+
+    audio_choice = _audio_device_selector(key="browser_audio_device")
+    local_audio_device_index = None if audio_choice is None else int(audio_choice)
+    st.caption("当前路径：浏览器只负责摄像头；麦克风使用下方 sounddevice 设备。")
 
     session = st.session_state.get("fusion_session")
     if session is None or session.finalized:
@@ -395,25 +420,25 @@ def _browser_fusion_capture(
         st.session_state.fusion_session = session
 
     try:
-        context = webrtc_streamer(
-            key=_browser_component_key(
+        webrtc_options = {
+            "key": _browser_component_key(
                 "audio-visual-fusion", component_generation
             ),
-            mode=WebRtcMode.SENDRECV,
-            video_processor_factory=lambda: FusionVideoProcessor(
+            "mode": WebRtcMode.SENDRECV,
+            "video_processor_factory": lambda: FusionVideoProcessor(
                 session, confidence_threshold, person_only
             ),
-            audio_processor_factory=lambda: FusionAudioProcessor(session),
-            media_stream_constraints={
+            "media_stream_constraints": {
                 "video": {
                     "width": {"ideal": 1280},
                     "height": {"ideal": 720},
                 },
-                "audio": True,
+                "audio": False,
             },
-            sendback_audio=False,
-            async_processing=True,
-        )
+            "sendback_audio": False,
+            "async_processing": True,
+        }
+        context = webrtc_streamer(**webrtc_options)
     except Exception as exc:
         st.error(f"浏览器音视频组件启动失败：{exc}")
         st.info("请切换到“OpenCV 摄像头 + sounddevice 麦克风（推荐）”。")
@@ -427,8 +452,27 @@ def _browser_fusion_capture(
     sample_slot = st.empty()
 
     was_playing = context.state.playing
+    audio_worker_key = "browser_fusion_audio_worker"
+    audio_worker = st.session_state.get(audio_worker_key)
     if was_playing:
         st.session_state.fusion_capture_active = True
+        worker_needs_restart = (
+            audio_worker is None
+            or audio_worker.session is not session
+            or audio_worker.audio_device_index != local_audio_device_index
+            or not audio_worker.running
+        )
+        if worker_needs_restart:
+            if audio_worker is not None:
+                audio_worker.stop()
+            audio_worker = LocalAudioWorker(local_audio_device_index, session)
+            audio_worker.start()
+            st.session_state[audio_worker_key] = audio_worker
+        if audio_worker.audio_error:
+            st.warning("本机麦克风采集异常：" + audio_worker.audio_error)
+    elif audio_worker is not None and audio_worker.running:
+        audio_worker.stop()
+
     while context.state.playing:
         status = session.status()
         visual = status["visual"]
@@ -455,6 +499,9 @@ def _browser_fusion_capture(
     )
     if should_finalize:
         with st.spinner("正在对齐时间戳并生成图像..."):
+            audio_worker = st.session_state.get(audio_worker_key)
+            if audio_worker is not None:
+                audio_worker.stop()
             artifacts = session.finalize()
             st.session_state.last_fusion_artifacts = artifacts
             st.session_state.fusion_capture_active = False
@@ -464,7 +511,73 @@ def _browser_fusion_capture(
         _display_capture_artifacts(artifacts)
 
 
-def _audio_device_selector() -> int | None:
+def _audio_meter_html(meter: float) -> str:
+    block_count = 16
+    active_count = int(round(max(0.0, min(1.0, meter)) * block_count))
+    blocks = []
+    for index in range(block_count):
+        color = "#c8d8ce" if index < active_count else "rgba(255,255,255,0.12)"
+        blocks.append(
+            "<span style='display:inline-block;width:7px;height:18px;"
+            f"border-radius:5px;background:{color};margin-right:9px;'></span>"
+        )
+    return (
+        "<div style='display:flex;align-items:center;gap:18px;"
+        "padding:8px 0 2px 0;'>"
+        "<div style='min-width:82px;font-weight:600;'>输入电平</div>"
+        "<div style='display:flex;align-items:center;'>"
+        + "".join(blocks)
+        + "</div></div>"
+    )
+
+
+@st.fragment(run_every=0.7)
+def _render_audio_input_level(device_index: int | None, key: str) -> None:
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        st.markdown(_audio_meter_html(0.0), unsafe_allow_html=True)
+        st.caption("测试环境中不打开真实麦克风。")
+        return
+
+    monitor_key = f"{key}_monitor"
+    monitor = st.session_state.get(monitor_key)
+    local_worker = st.session_state.get("local_fusion_worker")
+    browser_worker = st.session_state.get("browser_fusion_audio_worker")
+    if (
+        local_worker is not None
+        and getattr(local_worker, "running", False)
+        or browser_worker is not None
+        and getattr(browser_worker, "running", False)
+    ):
+        if monitor is not None:
+            monitor.stop()
+        st.markdown(_audio_meter_html(0.0), unsafe_allow_html=True)
+        st.caption("采集中：实时声强请看下方采集指标。")
+        return
+
+    if (
+        monitor is None
+        or monitor.audio_device_index != device_index
+        or not monitor.running
+    ):
+        if monitor is not None:
+            monitor.stop()
+        monitor = AudioLevelWorker(device_index)
+        monitor.start()
+        st.session_state[monitor_key] = monitor
+
+    if monitor.error:
+        st.markdown(_audio_meter_html(0.0), unsafe_allow_html=True)
+        st.caption(monitor.error)
+        return
+
+    level = monitor.status()
+    st.markdown(_audio_meter_html(float(level["meter"])), unsafe_allow_html=True)
+    st.caption(
+        f"{level['name']}｜{level['dbfs']:.1f} dBFS｜峰值 {level['peak']:.3f}"
+    )
+
+
+def _audio_device_selector(key: str = "local_audio_device") -> int | None:
     try:
         default_device = get_default_input_device()
         devices = list_audio_input_devices()
@@ -472,8 +585,23 @@ def _audio_device_selector() -> int | None:
         st.warning(str(exc))
         return None
 
+    refresh_col, _ = st.columns([1, 1])
+    if refresh_col.button("刷新麦克风列表", key=f"{key}_refresh"):
+        st.rerun()
+    st.caption(
+        "如果刚插入 USB 麦克风后仍未出现，请重启 Streamlit；"
+        "macOS/PortAudio 有时会缓存启动时的设备列表。"
+    )
+
     options: list[int | None] = [None] + [item["index"] for item in devices]
     device_names = {item["index"]: item["name"] for item in devices}
+    device_details = {
+        item["index"]: (
+            f"{item['name']}｜{item['max_input_channels']}ch｜"
+            f"{int(item['default_samplerate'])} Hz"
+        )
+        for item in devices
+    }
     default_text = (
         f"默认麦克风（{default_device['name']}）"
         if default_device
@@ -485,8 +613,17 @@ def _audio_device_selector() -> int | None:
         format_func=lambda value: default_text
         if value is None
         else f"{value}: {device_names.get(value, '未知设备')}",
-        key="local_audio_device",
+        key=key,
     )
+    if devices:
+        with st.expander("当前 sounddevice 可见输入设备"):
+            for item in devices:
+                st.write(f"{item['index']}: {device_details[item['index']]}")
+    else:
+        st.warning("sounddevice 当前没有枚举到输入设备。")
+
+    selected_index = None if selected is None else int(selected)
+    _render_audio_input_level(selected_index, key=f"{key}_level")
     return selected
 
 
@@ -566,12 +703,9 @@ def _render_local_fusion_worker(worker_key: str) -> None:
 def _local_fusion_capture(
     confidence_threshold: float, person_only: bool
 ) -> None:
-    st.caption(
-        "推荐本地实验使用此通路：OpenCV 直接读取摄像头，sounddevice 直接读取麦克风，"
-        "不依赖浏览器 SELECT DEVICE。"
-    )
+    st.info("本机固定实验用这条路径：下方选择 OpenCV 摄像头和 sounddevice 麦克风。")
     camera_index = _camera_index_controls("fusion")
-    audio_device_index = _audio_device_selector()
+    audio_device_index = _audio_device_selector(key="local_audio_device")
     if st.button("运行采集前检查"):
         with st.spinner("正在检查摄像头、麦克风、检测器和输出目录..."):
             checks = _run_local_preflight(camera_index, audio_device_index)
@@ -655,6 +789,15 @@ def _stop_inactive_local_workers(mode: str) -> None:
         and not fusion_worker.session.finalized
     ):
         st.session_state.last_fusion_artifacts = fusion_worker.stop_and_finalize()
+
+    browser_audio_worker = st.session_state.get("browser_fusion_audio_worker")
+    if mode != "视觉—音频同步采集" and browser_audio_worker:
+        browser_audio_worker.stop()
+
+    if mode != "视觉—音频同步采集":
+        for key, value in list(st.session_state.items()):
+            if key.endswith("_level_monitor") and value is not None:
+                value.stop()
 
 
 def _render_device_diagnostics(detector: Detector) -> None:

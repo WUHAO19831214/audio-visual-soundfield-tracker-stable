@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from pathlib import Path
@@ -213,3 +214,133 @@ class LocalFusionWorker(LocalCameraWorker):
             finally:
                 self._audio_stream = None
         super().stop()
+
+
+class LocalAudioWorker:
+    """Capture a sounddevice microphone into an existing fusion session."""
+
+    def __init__(
+        self,
+        audio_device_index: int | None,
+        session: SynchronizedCaptureSession,
+    ) -> None:
+        self.audio_device_index = audio_device_index
+        self.session = session
+        self._audio_stream = None
+        self._audio_sample_rate = 48_000
+        self.audio_error = ""
+
+    @property
+    def running(self) -> bool:
+        return self._audio_stream is not None
+
+    def start(self) -> None:
+        if self.running:
+            return
+        try:
+            device = check_audio_input_device(self.audio_device_index)
+            import sounddevice as sd
+
+            block_size = max(1, int(device["sample_rate"] * 0.1))
+            self._audio_sample_rate = device["sample_rate"]
+            self._audio_stream = sd.InputStream(
+                device=self.audio_device_index,
+                channels=1,
+                samplerate=device["sample_rate"],
+                blocksize=block_size,
+                dtype="float32",
+                callback=self._audio_callback,
+            )
+            self._audio_stream.start()
+        except Exception as exc:
+            self.audio_error = str(exc)
+
+    def _audio_callback(self, indata, frames, time_info, status) -> None:
+        if status:
+            self.audio_error = str(status)
+        self.session.audio_recorder.add_samples(
+            np.asarray(indata).copy(), int(self._audio_sample_rate)
+        )
+
+    def stop(self) -> None:
+        if self._audio_stream is not None:
+            try:
+                self._audio_stream.stop()
+                self._audio_stream.close()
+            finally:
+                self._audio_stream = None
+
+
+class AudioLevelWorker:
+    """Continuously monitor a sounddevice input level for the UI meter."""
+
+    def __init__(self, audio_device_index: int | None) -> None:
+        self.audio_device_index = audio_device_index
+        self._audio_stream = None
+        self._lock = threading.RLock()
+        self._level = {
+            "name": "",
+            "sample_rate": 0,
+            "rms": 0.0,
+            "peak": 0.0,
+            "dbfs": -120.0,
+            "meter": 0.0,
+        }
+        self.error = ""
+
+    @property
+    def running(self) -> bool:
+        return self._audio_stream is not None
+
+    def start(self) -> None:
+        if self.running:
+            return
+        try:
+            device = check_audio_input_device(self.audio_device_index)
+            import sounddevice as sd
+
+            sample_rate = int(device["sample_rate"])
+            block_size = max(1, int(sample_rate * 0.08))
+            with self._lock:
+                self._level.update(
+                    name=device["name"],
+                    sample_rate=sample_rate,
+                )
+            self._audio_stream = sd.InputStream(
+                device=self.audio_device_index,
+                channels=1,
+                samplerate=sample_rate,
+                blocksize=block_size,
+                dtype="float32",
+                callback=self._audio_callback,
+            )
+            self._audio_stream.start()
+        except Exception as exc:
+            self.error = str(exc)
+
+    def _audio_callback(self, indata, frames, time_info, status) -> None:
+        if status:
+            self.error = str(status)
+        samples = np.asarray(indata, dtype=np.float32).reshape(-1)
+        if samples.size:
+            rms = float(np.sqrt(np.mean(samples**2)))
+            peak = float(np.max(np.abs(samples)))
+        else:
+            rms = 0.0
+            peak = 0.0
+        dbfs = 20.0 * math.log10(max(rms, 1e-12))
+        meter = min(1.0, max(0.0, (dbfs + 80.0) / 60.0))
+        with self._lock:
+            self._level.update(rms=rms, peak=peak, dbfs=dbfs, meter=meter)
+
+    def status(self) -> dict:
+        with self._lock:
+            return self._level.copy()
+
+    def stop(self) -> None:
+        if self._audio_stream is not None:
+            try:
+                self._audio_stream.stop()
+                self._audio_stream.close()
+            finally:
+                self._audio_stream = None

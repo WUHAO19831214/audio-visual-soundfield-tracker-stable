@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import math
+
+import numpy as np
+
 
 class AudioDeviceError(RuntimeError):
     pass
@@ -73,3 +77,43 @@ def check_audio_input_device(device_index: int | None = None) -> dict:
     except Exception as exc:
         label = "默认麦克风" if device_index is None else f"麦克风 index={device_index}"
         raise AudioDeviceError(f"{label}不可用：{exc}") from exc
+
+
+def measure_audio_input_level(
+    device_index: int | None = None, duration_sec: float = 0.5
+) -> dict:
+    """Record a short block and return a simple input-level summary."""
+    sd = _load_sounddevice()
+    device = check_audio_input_device(device_index)
+    sample_rate = int(device["sample_rate"])
+    frame_count = max(1, int(sample_rate * duration_sec))
+    try:
+        recording = sd.rec(
+            frame_count,
+            samplerate=sample_rate,
+            channels=1,
+            dtype="float32",
+            device=device_index,
+        )
+        sd.wait()
+    except Exception as exc:
+        label = "默认麦克风" if device_index is None else f"麦克风 index={device_index}"
+        raise AudioDeviceError(f"{label}输入电平读取失败：{exc}") from exc
+
+    samples = np.asarray(recording, dtype=np.float32).reshape(-1)
+    if samples.size == 0:
+        rms = 0.0
+        peak = 0.0
+    else:
+        rms = float(np.sqrt(np.mean(samples**2)))
+        peak = float(np.max(np.abs(samples)))
+    dbfs = 20.0 * math.log10(max(rms, 1e-12))
+    meter = min(1.0, max(0.0, (dbfs + 80.0) / 60.0))
+    return {
+        "name": device["name"],
+        "sample_rate": sample_rate,
+        "rms": rms,
+        "peak": peak,
+        "dbfs": dbfs,
+        "meter": meter,
+    }
