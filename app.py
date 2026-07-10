@@ -15,7 +15,8 @@ import streamlit as st
 from src.audio_devices import (
     AudioDeviceError,
     check_audio_input_device,
-    get_default_input_device,
+    diagnose_audio_devices,
+    find_preferred_input_device,
     get_default_input_device_index,
     list_audio_input_devices,
     test_audio_input_device,
@@ -584,8 +585,12 @@ def _browser_fusion_capture(
         "3. 麦克风在下面选择，推荐 `Wireless Mic Rx` 或系统默认麦克风。"
     )
 
-    audio_choice = _audio_device_selector(key="browser_audio_device")
-    local_audio_device_index = None if audio_choice is None else int(audio_choice)
+    _audio_device_selector(key="browser_audio_device")
+    local_audio_device_index = st.session_state.get("selected_audio_input_index")
+    if local_audio_device_index is None:
+        st.error("没有可用的 sounddevice 输入设备，无法开始浏览器摄像头 + 本机麦克风采集。")
+        return
+    local_audio_device_index = int(local_audio_device_index)
     st.caption(
         "当前采集路径：浏览器只负责摄像头；麦克风使用 sounddevice 设备 "
         f"{st.session_state.get('browser_audio_device_selected_audio_input_name', '')} "
@@ -791,72 +796,105 @@ def _render_audio_input_level(device_index: int | None, key: str) -> None:
 
 
 def _audio_device_selector(key: str = "local_audio_device") -> int | None:
-    try:
-        default_device = get_default_input_device()
-        devices = list_audio_input_devices()
-    except AudioDeviceError as exc:
-        st.warning(str(exc))
+    devices_key = f"{key}_audio_devices"
+    refresh_time_key = f"{key}_audio_refresh_time"
+    choice_reason_key = f"{key}_audio_choice_reason"
+
+    def set_selection(
+        index: int | None,
+        devices: list[dict],
+        reason: str,
+        update_widget: bool = True,
+    ) -> None:
+        by_index = {item["index"]: item for item in devices}
+        selected = by_index.get(index)
+        if selected is None:
+            st.session_state["selected_audio_input_index"] = None
+            st.session_state["selected_audio_input_name"] = ""
+            return
+        if update_widget:
+            st.session_state[key] = selected["index"]
+        st.session_state["selected_audio_input_index"] = selected["index"]
+        st.session_state["selected_audio_input_name"] = selected["name"]
+        st.session_state[f"{key}_selected_audio_input_index"] = selected["index"]
+        st.session_state[f"{key}_selected_audio_input_name"] = selected["name"]
+        st.session_state[choice_reason_key] = reason
+
+    refresh_col, prefer_col = st.columns(2)
+    force_refresh = refresh_col.button("刷新麦克风列表", key=f"{key}_refresh")
+    if force_refresh or devices_key not in st.session_state:
+        try:
+            devices = list_audio_input_devices(force_refresh=True)
+        except AudioDeviceError as exc:
+            st.error(str(exc))
+            devices = []
+        st.session_state[devices_key] = devices
+        st.session_state[refresh_time_key] = datetime.now().strftime("%H:%M:%S")
+        previous_index = st.session_state.get("selected_audio_input_index")
+        available_indexes = {item["index"] for item in devices}
+        if previous_index in available_indexes:
+            set_selection(previous_index, devices, "刷新后保留原选择 index")
+        else:
+            preferred, reason = find_preferred_input_device(devices)
+            set_selection(preferred["index"] if preferred else None, devices, reason)
+
+    devices = st.session_state.get(devices_key, [])
+    if prefer_col.button("优先选择 Wireless Mic Rx", key=f"{key}_prefer_wireless"):
+        preferred, reason = find_preferred_input_device(devices)
+        set_selection(preferred["index"] if preferred else None, devices, reason)
+
+    st.caption(
+        "刷新会重新调用 sounddevice.query_devices()。"
+        "若仍未出现 Wireless Mic Rx，请重新插拔 USB 接收器或重启 Streamlit。"
+    )
+    if st.session_state.get(refresh_time_key):
+        st.caption(f"最近刷新时间：{st.session_state[refresh_time_key]}")
+    if not devices:
+        st.session_state["selected_audio_input_index"] = None
+        st.session_state["selected_audio_input_name"] = ""
+        st.error("没有枚举到可用输入设备，无法开始同步采集。")
         return None
 
-    refresh_col, _ = st.columns([1, 1])
-    if refresh_col.button("刷新麦克风列表", key=f"{key}_refresh"):
-        st.rerun()
-    st.caption(
-        "如果刚插入 USB 麦克风后仍未出现，请重启 Streamlit；"
-        "macOS/PortAudio 有时会缓存启动时的设备列表。"
-    )
-
-    options: list[int | None] = [None] + [item["index"] for item in devices]
-    device_names = {item["index"]: item["name"] for item in devices}
-    device_details = {
-        item["index"]: (
-            f"{item['name']}｜{item['max_input_channels']}ch｜"
-            f"{int(item['default_samplerate'])} Hz"
-        )
-        for item in devices
-    }
-    default_text = (
-        f"默认麦克风（{default_device['name']}）"
-        if default_device
-        else "默认麦克风"
-    )
-    selected = st.selectbox(
+    available_indexes = [item["index"] for item in devices]
+    current_index = st.session_state.get("selected_audio_input_index")
+    if current_index not in available_indexes:
+        preferred, reason = find_preferred_input_device(devices)
+        set_selection(preferred["index"] if preferred else None, devices, reason)
+    labels = {item["index"]: item["display_name"] for item in devices}
+    default_index = get_default_input_device_index()
+    selected_index = st.selectbox(
         "麦克风输入设备",
-        options=options,
-        format_func=lambda value: default_text
-        if value is None
-        else f"{device_names.get(value, '未知设备')} | index={value} | "
-        f"{int(next((item['default_samplerate'] for item in devices if item['index'] == value), 0))} Hz",
+        options=available_indexes,
+        format_func=lambda value: (
+            "默认麦克风：" + labels[value]
+            if value == default_index
+            else labels[value]
+        ),
         key=key,
     )
-    if devices:
-        with st.expander("当前 sounddevice 可见输入设备"):
-            for item in devices:
-                st.write(f"{item['index']}: {device_details[item['index']]}")
-    else:
-        st.warning("sounddevice 当前没有枚举到输入设备。")
-
-    selected_index = (
-        None
-        if selected is None and default_device is None
-        else int(default_device["index"])
-        if selected is None
-        else int(selected)
+    selected = next(item for item in devices if item["index"] == selected_index)
+    set_selection(
+        selected_index,
+        devices,
+        "用户在下拉框选择",
+        update_widget=False,
     )
-    selected_name = (
-        default_device["name"]
-        if selected is None and default_device
-        else device_names.get(selected_index, "默认麦克风")
-    )
-    st.session_state["selected_audio_input_index"] = selected_index
-    st.session_state["selected_audio_input_name"] = selected_name
-    st.session_state[f"{key}_selected_audio_input_index"] = selected_index
-    st.session_state[f"{key}_selected_audio_input_name"] = selected_name
     st.caption(
-        f"正式采集将使用 sounddevice 设备：{selected_name} | index={selected_index}"
+        "正式采集固定使用 sounddevice input index："
+        f"{selected['index']}（{selected['name']}）。"
     )
+    if st.session_state.get(choice_reason_key):
+        st.info("当前选择原因：" + st.session_state[choice_reason_key])
+    if not any("wireless mic rx" in item["name"].casefold() for item in devices):
+        if any("usb audio codec" in item["name"].casefold() for item in devices):
+            st.warning(
+                "未枚举到 Wireless Mic Rx，但发现 USB audio CODEC。"
+                "部分无线麦克风接收器会以 USB audio CODEC 显示，可以先选择并测试它。"
+            )
+        else:
+            st.warning("未枚举到 Wireless Mic Rx。请点击刷新，或查看下方“麦克风诊断”建议。")
     _render_audio_input_level(selected_index, key=f"{key}_level")
-    return selected_index
+    return int(st.session_state["selected_audio_input_index"])
 
 
 def _format_audio_time(value) -> str:
@@ -895,28 +933,40 @@ def _microphone_diagnostics(
     capture_status: dict | None = None,
 ) -> None:
     with st.expander("麦克风诊断", expanded=False):
-        try:
-            devices = list_audio_input_devices()
-            default_index, default_note = get_default_input_device_index()
-        except AudioDeviceError as exc:
-            st.warning(str(exc))
-            devices = []
-            default_index, default_note = None, ""
-
+        diagnostics = diagnose_audio_devices()
+        if not diagnostics["ok"]:
+            st.error("sounddevice 诊断失败：" + diagnostics["error"])
+            return
+        devices = diagnostics["devices"]
         selected_name = st.session_state.get(f"{selector_key}_selected_audio_input_name", "")
         st.write(f"当前选择设备：`{selected_name or '--'}`")
         st.write(f"当前选择 device index：`{selected_index}`")
-        st.write(f"当前默认 input device：`{default_index}` {default_note}")
+        st.write(f"当前系统默认 input index：`{diagnostics['default_input_index']}`")
+        st.write(f"sounddevice 版本：`{diagnostics['sounddevice_version']}`")
+        st.write(f"sounddevice 默认设备：`{diagnostics['default_device']}`")
+        st.write(f"是否发现 Wireless Mic Rx：`{diagnostics['wireless_mic_rx_found']}`")
+        st.write(f"是否发现 USB audio CODEC：`{diagnostics['usb_audio_codec_found']}`")
+        st.write(
+            "推荐设备：`"
+            + (
+                diagnostics["recommended_device"]["display_name"]
+                if diagnostics["recommended_device"]
+                else "--"
+            )
+            + "`"
+        )
+        st.caption("推荐原因：" + diagnostics["recommendation_reason"])
+        refresh_time = st.session_state.get(f"{selector_key}_audio_refresh_time")
+        if refresh_time:
+            st.caption(f"页面最近刷新时间：{refresh_time}")
         if devices:
             st.caption("当前可见输入设备")
             for item in devices:
-                st.text(
-                    f"{item['index']}: {item['name']} | "
-                    f"{item['max_input_channels']}ch | "
-                    f"{int(item['default_samplerate'])} Hz"
-                )
+                st.text(item["display_name"] + f" | hostapi={item['hostapi']}")
         else:
             st.warning("sounddevice 当前没有枚举到输入设备。")
+        for suggestion in diagnostics["suggestions"]:
+            st.info(suggestion)
 
         test_key = f"{selector_key}_last_audio_test"
         button_col, reset_col = st.columns(2)
@@ -1042,7 +1092,10 @@ def _local_fusion_capture(
 ) -> None:
     st.info("本机固定实验用这条路径：下方选择 OpenCV 摄像头和 sounddevice 麦克风。")
     camera_index = _camera_index_controls("fusion")
-    audio_device_index = _audio_device_selector(key="local_audio_device")
+    _audio_device_selector(key="local_audio_device")
+    audio_device_index = st.session_state.get("selected_audio_input_index")
+    if audio_device_index is not None:
+        audio_device_index = int(audio_device_index)
     worker_key = "local_fusion_worker"
     worker = st.session_state.get(worker_key)
     _microphone_diagnostics(
@@ -1061,7 +1114,9 @@ def _local_fusion_capture(
 
     start_col, stop_col = st.columns(2)
     if start_col.button(
-        "开始同步采集", type="primary", disabled=bool(worker and worker.running)
+        "开始同步采集",
+        type="primary",
+        disabled=bool(worker and worker.running) or audio_device_index is None,
     ):
         checks = _run_local_preflight(camera_index, audio_device_index)
         st.session_state.local_preflight_checks = checks

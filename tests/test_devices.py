@@ -94,10 +94,9 @@ def test_default_input_index_uses_input_side_of_pair(monkeypatch) -> None:
 
     monkeypatch.setattr(audio_devices, "_load_sounddevice", lambda: FakeSoundDevice())
 
-    index, note = audio_devices.get_default_input_device_index()
+    index = audio_devices.get_default_input_device_index()
 
     assert index == 4
-    assert "默认输入" in note
 
 
 def test_audio_device_list_only_returns_inputs(monkeypatch) -> None:
@@ -119,8 +118,11 @@ def test_audio_device_list_only_returns_inputs(monkeypatch) -> None:
             "name": "Wireless Mic Rx",
             "max_input_channels": 1,
             "default_samplerate": 48_000.0,
+            "hostapi": "unknown",
+            "is_default": False,
             "channels": 1,
             "samplerate": 48_000.0,
+            "display_name": "Wireless Mic Rx | index=1 | 48000 Hz | channels=1",
         }
     ]
 
@@ -154,3 +156,74 @@ def test_audio_input_test_returns_error_instead_of_raising(monkeypatch) -> None:
 
     assert result["ok"] is False
     assert "input busy" in result["error"]
+
+
+def test_preferred_device_chooses_wireless_mic_rx() -> None:
+    devices = [
+        {
+            "index": 3,
+            "name": "USB audio CODEC",
+            "is_default": True,
+        },
+        {
+            "index": 4,
+            "name": "Wireless Mic Rx",
+            "is_default": False,
+        },
+    ]
+
+    device, reason = audio_devices.find_preferred_input_device(devices)
+
+    assert device["index"] == 4
+    assert "Wireless Mic Rx" in reason
+
+
+def test_preferred_device_falls_back_to_usb_audio_codec() -> None:
+    devices = [
+        {"index": 1, "name": "MacBook Air麦克风", "is_default": False},
+        {"index": 3, "name": "USB audio CODEC", "is_default": True},
+    ]
+
+    device, reason = audio_devices.find_preferred_input_device(devices)
+
+    assert device["index"] == 3
+    assert "USB audio CODEC" in reason
+
+
+def test_device_enumeration_skips_one_malformed_device(monkeypatch) -> None:
+    class Default:
+        device = [2, 6]
+
+    class FakeSoundDevice:
+        default = Default()
+
+        @staticmethod
+        def query_devices(index=None, kind=None):
+            if index is not None:
+                return {
+                    "name": "Wireless Mic Rx",
+                    "max_input_channels": 1,
+                    "default_samplerate": 48_000,
+                }
+            return [
+                {"name": "Bad", "max_input_channels": "not-a-number"},
+                {"name": "Output", "max_input_channels": 0, "default_samplerate": 48_000},
+                {
+                    "name": "Wireless Mic Rx",
+                    "max_input_channels": 1,
+                    "default_samplerate": 48_000,
+                    "hostapi": 0,
+                },
+            ]
+
+        @staticmethod
+        def query_hostapis(index):
+            return {"name": "Core Audio"}
+
+    monkeypatch.setattr(audio_devices, "_load_sounddevice", lambda: FakeSoundDevice())
+
+    devices = audio_devices.list_audio_input_devices(force_refresh=True)
+
+    assert len(devices) == 1
+    assert devices[0]["index"] == 2
+    assert devices[0]["hostapi"] == "Core Audio"
