@@ -86,3 +86,75 @@ def test_finalize_summary_marks_zero_audio_as_not_ok(tmp_path: Path) -> None:
     assert summary["video_sample_count"] == 1
     assert summary["audio_sample_count"] == 0
     assert "不可信" in summary["warning"]
+
+
+def test_custom_object_tracking_fields_are_fused() -> None:
+    visuals = [
+        {
+            "timestamp": 2.0,
+            "track_id": 1,
+            "center_x": 80,
+            "center_y": 60,
+            "bbox_width": 20,
+            "bbox_height": 30,
+            "tracking_mode": "custom_object_template",
+            "track_class": "custom_object",
+            "tracking_status": "tracking",
+        }
+    ]
+
+    fused = fuse_records(visuals, [audio_row(2.0)])
+
+    assert fused[0]["matched"] is True
+    assert fused[0]["tracking_mode"] == "custom_object_template"
+    assert fused[0]["track_class"] == "custom_object"
+    assert fused[0]["tracking_status"] == "tracking"
+    assert fused[0]["track_id"] == 1
+
+
+def test_custom_object_lost_frame_is_not_matched() -> None:
+    visuals = [
+        {
+            "timestamp": 3.0,
+            "track_id": "",
+            "center_x": "",
+            "center_y": "",
+            "bbox_width": "",
+            "bbox_height": "",
+            "tracking_mode": "custom_object_template",
+            "track_class": "custom_object",
+            "tracking_status": "lost",
+        }
+    ]
+
+    fused = fuse_records(visuals, [audio_row(3.0)])
+
+    assert fused[0]["matched"] is False
+    assert fused[0]["tracking_status"] == "lost"
+
+
+def test_tennis_marker_fields_are_fused() -> None:
+    visuals = [
+        {
+            "timestamp": 4.0,
+            "track_id": 1,
+            "center_x": 120,
+            "center_y": 90,
+            "bbox_width": 28,
+            "bbox_height": 28,
+            "tracking_mode": "tennis_ball_color",
+            "track_class": "tennis_ball_marker",
+            "tracking_status": "tracking",
+            "marker_radius": 14.0,
+            "marker_area": 500.0,
+            "marker_circularity": 0.91,
+            "lost_frame_count": 0,
+        }
+    ]
+
+    fused = fuse_records(visuals, [audio_row(4.0)])
+
+    assert fused[0]["matched"] is True
+    assert fused[0]["tracking_mode"] == "tennis_ball_color"
+    assert fused[0]["track_class"] == "tennis_ball_marker"
+    assert fused[0]["marker_radius"] == 14.0

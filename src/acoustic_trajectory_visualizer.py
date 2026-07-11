@@ -23,6 +23,31 @@ def _metric_info(metric: str) -> tuple[str, str, str]:
     return METRIC_LABELS.get(metric, (metric, "", "viridis"))
 
 
+def _trajectory_subject(frame: pd.DataFrame, csv_path: str | Path | None = None) -> str:
+    if "tracking_mode" in frame.columns and frame["tracking_mode"].astype(str).eq(
+        "tennis_ball_color"
+    ).any():
+        return "Tennis ball marker track"
+    if "tracking_mode" in frame.columns and frame["tracking_mode"].astype(str).eq(
+        "custom_object_template"
+    ).any():
+        return "Custom object track"
+    if csv_path is not None:
+        try:
+            raw = pd.read_csv(csv_path, usecols=["tracking_mode"])
+        except (ValueError, OSError):
+            raw = pd.DataFrame()
+        if "tracking_mode" in raw.columns and raw["tracking_mode"].astype(str).eq(
+            "tennis_ball_color"
+        ).any():
+            return "Tennis ball marker track"
+        if "tracking_mode" in raw.columns and raw["tracking_mode"].astype(str).eq(
+            "custom_object_template"
+        ).any():
+            return "Custom object track"
+    return "Tracked person"
+
+
 def _load_points(fused_csv_path: str | Path, metric: str) -> pd.DataFrame:
     frame = pd.read_csv(fused_csv_path)
     if "matched" in frame:
@@ -75,8 +100,13 @@ def save_acoustic_trajectory_values(
 ) -> Path:
     """Save a trajectory plot with numeric acoustic labels."""
     frame = _load_points(fused_csv_path, metric)
+    subject = _trajectory_subject(frame, fused_csv_path)
     if frame.empty:
-        return _save_placeholder(output_path, metric, "No matched acoustic trajectory data")
+        return _save_placeholder(
+            output_path,
+            metric,
+            f"{subject}: no matched acoustic trajectory data",
+        )
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -98,7 +128,10 @@ def save_acoustic_trajectory_values(
             fontsize=8,
             color="#111111",
         )
-    axis.set_title(f"{title} values along visual trajectory" + (f" ({unit})" if unit else ""))
+    axis.set_title(
+        f"{subject} | {title} values along visual trajectory"
+        + (f" ({unit})" if unit else "")
+    )
     figure.savefig(output, dpi=160)
     plt.close(figure)
     return output
@@ -112,8 +145,13 @@ def save_acoustic_trajectory_colormap(
 ) -> Path:
     """Save a trajectory plot using color to encode one acoustic metric."""
     frame = _load_points(fused_csv_path, metric)
+    subject = _trajectory_subject(frame, fused_csv_path)
     if frame.empty:
-        return _save_placeholder(output_path, metric, "No matched acoustic trajectory data")
+        return _save_placeholder(
+            output_path,
+            metric,
+            f"{subject}: no matched acoustic trajectory data",
+        )
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -131,7 +169,7 @@ def save_acoustic_trajectory_colormap(
         linewidths=0.4,
     )
     figure.colorbar(rendered, ax=axis, label=f"{title}" + (f" ({unit})" if unit else ""))
-    axis.set_title(f"{title} colormap along visual trajectory")
+    axis.set_title(f"{subject} | {title} colormap along visual trajectory")
     figure.savefig(output, dpi=160)
     plt.close(figure)
     return output

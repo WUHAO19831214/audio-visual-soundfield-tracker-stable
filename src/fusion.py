@@ -24,6 +24,13 @@ FUSED_FIELDS = [
     "center_y",
     "bbox_width",
     "bbox_height",
+    "tracking_mode",
+    "track_class",
+    "tracking_status",
+    "marker_radius",
+    "marker_area",
+    "marker_circularity",
+    "lost_frame_count",
     "rms",
     "db",
     "dominant_frequency_hz",
@@ -38,6 +45,13 @@ VISUAL_FIELDS = [
     "center_y",
     "bbox_width",
     "bbox_height",
+    "tracking_mode",
+    "track_class",
+    "tracking_status",
+    "marker_radius",
+    "marker_area",
+    "marker_circularity",
+    "lost_frame_count",
 ]
 
 AUDIO_FIELDS = [
@@ -88,7 +102,21 @@ def fuse_records(
             nearest = visuals[nearest_index]
             time_diff = abs(float(nearest["timestamp"]) - timestamp)
 
-        matched = nearest is not None and time_diff is not None and time_diff <= max_time_diff_sec
+        tracking_mode = nearest.get("tracking_mode", "person_yolo") if nearest else ""
+        track_class = nearest.get("track_class", "person") if nearest else ""
+        tracking_status = nearest.get("tracking_status", "tracking") if nearest else ""
+        has_position = bool(
+            nearest
+            and nearest.get("center_x", "") != ""
+            and nearest.get("center_y", "") != ""
+            and tracking_status != "lost"
+        )
+        matched = (
+            nearest is not None
+            and time_diff is not None
+            and time_diff <= max_time_diff_sec
+            and has_position
+        )
         row = {
             "timestamp": timestamp,
             "matched": matched,
@@ -98,6 +126,17 @@ def fuse_records(
             "center_y": nearest.get("center_y", "") if matched else "",
             "bbox_width": nearest.get("bbox_width", "") if matched else "",
             "bbox_height": nearest.get("bbox_height", "") if matched else "",
+            "tracking_mode": tracking_mode,
+            "track_class": track_class,
+            "tracking_status": tracking_status,
+            "marker_radius": nearest.get("marker_radius", "") if matched else "",
+            "marker_area": nearest.get("marker_area", "") if matched else "",
+            "marker_circularity": (
+                nearest.get("marker_circularity", "") if matched else ""
+            ),
+            "lost_frame_count": (
+                nearest.get("lost_frame_count", "") if nearest else ""
+            ),
             "rms": audio_row.get("rms", ""),
             "db": audio_row.get("db", ""),
             "dominant_frequency_hz": audio_row.get("dominant_frequency_hz", ""),
@@ -135,6 +174,8 @@ class SynchronizedCaptureSession:
         self,
         output_dir: str | Path = "data/output",
         audio_block_duration_sec: float = 0.1,
+        tracking_mode: str = "person_yolo",
+        track_class: str = "person",
     ) -> None:
         self.output_dir = Path(output_dir)
         self.clock = SyncClock()
@@ -145,6 +186,12 @@ class SynchronizedCaptureSession:
         self._latest_audio: dict | None = None
         self._audio_device_info: dict = {}
         self._audio_error = ""
+        self._tracking_mode = tracking_mode
+        self._track_class = track_class
+        self._tracking_status = "ready"
+        self._tracking_total_frames = 0
+        self._tracking_success_frames = 0
+        self._tracking_lost_frames = 0
         self.finalized = False
         self.artifacts: CaptureArtifacts | None = None
         self.audio_recorder = AudioRecorder(
@@ -153,21 +200,62 @@ class SynchronizedCaptureSession:
             on_features=self.add_audio_record,
         )
 
-    def add_visual_track(self, timestamp: float, track: Mapping | None) -> None:
+    def add_visual_track(
+        self,
+        timestamp: float,
+        track: Mapping | None,
+        tracking_mode: str | None = None,
+        track_class: str | None = None,
+        tracking_status: str | None = None,
+        record_lost: bool = False,
+        lost_frame_count: int | None = None,
+    ) -> None:
         with self._lock:
+            mode = tracking_mode or self._tracking_mode
+            class_name = track_class or (
+                str(track.get("class_name", "")) if track is not None else ""
+            ) or self._track_class
+            status = tracking_status or ("tracking" if track is not None else "lost")
+            self._tracking_mode = mode
+            self._track_class = class_name
+            self._tracking_status = status
+            self._tracking_total_frames += 1
+            if track is not None and status == "tracking":
+                self._tracking_success_frames += 1
+            else:
+                self._tracking_lost_frames += 1
             if track is None:
                 self._latest_visual = None
-                return
+                if not record_lost:
+                    return
             row = {
                 "timestamp": float(timestamp),
-                "track_id": track.get("track_id", ""),
-                "center_x": track.get("center_x", ""),
-                "center_y": track.get("center_y", ""),
-                "bbox_width": track.get("bbox_width", ""),
-                "bbox_height": track.get("bbox_height", ""),
+                "track_id": track.get("track_id", "") if track else "",
+                "center_x": track.get("center_x", "") if track else "",
+                "center_y": track.get("center_y", "") if track else "",
+                "bbox_width": track.get("bbox_width", "") if track else "",
+                "bbox_height": track.get("bbox_height", "") if track else "",
+                "tracking_mode": mode,
+                "track_class": class_name,
+                "tracking_status": status,
+                "marker_radius": track.get("marker_radius", "") if track else "",
+                "marker_area": track.get("marker_area", "") if track else "",
+                "marker_circularity": (
+                    track.get("marker_circularity", "") if track else ""
+                ),
+                "lost_frame_count": (
+                    track.get("lost_frame_count", lost_frame_count or 0)
+                    if track
+                    else int(lost_frame_count or 0)
+                ),
             }
             self._visual_records.append(row)
-            self._latest_visual = row
+            self._latest_visual = row if track is not None else None
+
+    def set_tracking_configuration(self, tracking_mode: str, track_class: str) -> None:
+        with self._lock:
+            self._tracking_mode = tracking_mode
+            self._track_class = track_class
 
     def add_audio_record(self, row: Mapping) -> None:
         with self._lock:
@@ -201,6 +289,17 @@ class SynchronizedCaptureSession:
                 "elapsed_sec": self.clock.elapsed(),
                 "audio_device": self._audio_device_info.copy(),
                 "audio_error": self._audio_error,
+                "tracking_mode": self._tracking_mode,
+                "track_class": self._track_class,
+                "tracking_status": self._tracking_status,
+                "tracking_total_frames": self._tracking_total_frames,
+                "tracking_success_frames": self._tracking_success_frames,
+                "lost_frame_count": self._tracking_lost_frames,
+                "tracking_success_rate": (
+                    self._tracking_success_frames / self._tracking_total_frames
+                    if self._tracking_total_frames
+                    else 0.0
+                ),
             }
 
     def finalize(
@@ -210,6 +309,7 @@ class SynchronizedCaptureSession:
         acoustic_label_every: int = 10,
     ) -> CaptureArtifacts:
         """Freeze current data, export raw/fused CSV files, and make plots."""
+        self.audio_recorder.close()
         with self._lock:
             if self.artifacts is not None:
                 return self.artifacts
@@ -233,6 +333,11 @@ class SynchronizedCaptureSession:
         with self._lock:
             audio_device_info = self._audio_device_info.copy()
             audio_error = self._audio_error
+            tracking_mode = self._tracking_mode
+            track_class = self._track_class
+            tracking_total_frames = self._tracking_total_frames
+            tracking_success_frames = self._tracking_success_frames
+            tracking_lost_frames = self._tracking_lost_frames
 
         from .soundfield_visualizer import (
             plot_frequency_map,
@@ -311,6 +416,15 @@ class SynchronizedCaptureSession:
             "audio_started_at": audio_device_info.get("started_at", ""),
             "audio_last_chunk_at": audio_device_info.get("last_chunk_at", ""),
             "audio_error": audio_error or audio_device_info.get("last_error", ""),
+            "tracking_mode": tracking_mode,
+            "track_class": track_class,
+            "lost_frame_count": tracking_lost_frames,
+            "valid_tracking_frame_count": tracking_success_frames,
+            "tracking_success_rate": (
+                tracking_success_frames / tracking_total_frames
+                if tracking_total_frames
+                else 0.0
+            ),
         }
         summary_path = self.output_dir / f"{stem}_summary.json"
         summary_path.write_text(

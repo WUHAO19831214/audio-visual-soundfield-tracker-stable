@@ -168,6 +168,22 @@ audio: false
 
 声学轨迹图只使用 `matched=True` 且有像素坐标的数据行。数据为空或匹配点过少时，系统会生成带说明文字的占位 PNG，而不是让导出流程报错。当前同步采集尚未保存原始视频流，因此还不会生成“声学轨迹视频”；页面会明确提示这一限制。
 
+## 指定物体追踪模式
+
+“视觉—音频同步采集”默认仍使用 YOLO person。实验性的“指定物体”模式适合手持麦克风、小球、教具和标志物等单目标：先从当前 OpenCV 摄像头截取完整画面，或上传与采集相同机位的模板图，再通过 `x/y/width/height` 设置 ROI 并初始化 tracker。正式采集后，目标固定使用 `track_id=1` 和 `track_class=custom_object`，位置会与音频按同一时间戳融合，并继续生成融合 CSV、声强轨迹和频率轨迹图。
+
+系统按 CSRT、KCF、MIL 的顺序寻找当前 OpenCV 可用 tracker，并兼容 `cv2` 与 `cv2.legacy` API。若 CSRT/KCF 不可用会回退到 MIL；页面会显示实际 tracker。不要同时安装相互冲突的 `opencv-python` 与 `opencv-contrib-python`，若确实需要 CSRT/KCF，应先在单独环境评估 contrib 版本。
+
+当前 OpenCV 单目标 tracker 对遮挡、明显光照变化、快速旋转和大幅尺度变化较敏感。小物体建议贴明显颜色标记。更高阶方案可考虑 ArUco marker、SiamMask、OSTrack 或 Siamese-DETR，但这些不属于当前轻量实现。
+
+## 网球标记追踪模式
+
+“视觉—音频同步采集”默认仍是 YOLO person，也可以选择推荐的 `Tennis ball marker（网球标记追踪）`。该模式使用轻量的 HSV 颜色分割、形态学去噪、轮廓面积/圆度筛选和中心点平滑，不引入新的深度学习权重。它适合固定机位声场实验中的网球、手持标记物，或贴在麦克风附近的明显颜色标记。
+
+页面中可以直接使用默认黄绿色 HSV 阈值，也可以截取当前 OpenCV 摄像头画面或上传图片，再通过 `ROI x/y/width/height` 框定网球并自动估计 HSV。随后查看 mask 预览，点击“测试网球识别”，确认有 center、radius、area、circularity 后再点击“初始化网球追踪”。正式 START 后，系统记录网球中心点并与麦克风音频按时间戳融合。
+
+如果识别不稳，先调 H/S/V、面积和最小圆度，并观察 mask 是否只保留网球。网球应尽量保持在画面内，背景不要有大量相似黄绿色物体。该方法对光照、遮挡、球太小和背景相似颜色敏感；需要真实空间坐标时，后续可增加四角点标定和 perspective transform，将 `pixel_x/pixel_y` 转成 `real_x_m/real_y_m`。更高阶方案可考虑 ArUco marker 或专门训练的 tennis-ball YOLO。
+
 ## 时间同步规则
 
 - `src/sync_clock.py` 用一个共享 `SyncClock` 为视觉帧和音频块生成时间戳。
@@ -188,6 +204,11 @@ audio: false
 | `track_id` | 主追踪对象 ID |
 | `center_x`, `center_y` | 检测框中心的图像像素坐标 |
 | `bbox_width`, `bbox_height` | 检测框像素宽高 |
+| `tracking_mode` | `person_yolo`、`tennis_ball_color` 或 `custom_object_template` |
+| `track_class` | `person`、`tennis_ball_marker` 或 `custom_object` |
+| `tracking_status` | 当前视觉样本是 `tracking` 还是 `lost` |
+| `marker_radius`, `marker_area`, `marker_circularity` | 网球颜色分割的几何结果；其他模式为空 |
+| `lost_frame_count` | 连续丢失帧数 |
 | `rms` | 音频均方根幅值 |
 | `db` | 相对数字满刻度声强，dBFS |
 | `dominant_frequency_hz` | FFT 最大非直流分量的频率 |
@@ -230,6 +251,10 @@ python3 scripts/check_rfdetr_available.py
 3. 当前 `db` 是根据数字音频幅值计算的相对声强（dBFS），不是经过声级计校准的绝对声压级 dB SPL。浏览器或操作系统的自动增益也可能改变结果。
 4. 若要获得更准确的声场，应使用频响稳定的外接麦克风，固定输入增益，并使用声级计或校准器进行声学校准。
 5. 摄像头应固定不动；镜头移动会让图像坐标失去统一空间参考。
+
+## Good-Pickleball 对本轮改造的启发
+
+参考项目 [Good-Pickleball](https://github.com/yo-WASSUP/Good-Pickleball) 的价值主要在于把球检测、球员/小球轨迹、轨迹导出、实验区域标定和坐标映射组织成完整流程。它 README 中还展示了球场四角点标定、标准场地坐标和像素到场地位置的后续方向。本轮只借鉴这些数据组织和可视化思路，采用本项目自己的 HSV 颜色追踪，不直接复制代码，也不引入其 `tennis-ball.pt` 或其他大型模型权重。
 6. 当前系统适合课堂实验原型、相对分布分析和教学演示，不适合作为法定计量或工程验收设备。
 
 ## 测试

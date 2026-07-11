@@ -15,6 +15,7 @@ import streamlit as st
 from src.audio_devices import (
     AudioDeviceError,
     check_audio_input_device,
+    classify_input_device,
     diagnose_audio_devices,
     find_preferred_input_device,
     get_default_input_device_index,
@@ -34,6 +35,14 @@ from src.local_capture import (
     LocalFusionWorker,
     check_writable_directory,
 )
+from src.object_template_tracker import ObjectTemplateTracker, validate_bbox
+from src.tennis_ball_tracker import (
+    DEFAULT_HSV_LOWER,
+    DEFAULT_HSV_UPPER,
+    TennisBallTracker,
+    estimate_hsv_range_from_roi,
+    make_tennis_mask,
+)
 from src.trajectory_visualizer import (
     choose_main_track,
     draw_tracks_on_frame,
@@ -45,6 +54,9 @@ from src.trajectory_visualizer import (
 OUTPUT_DIR = Path("data/output")
 UPLOAD_DIR = Path("data/uploads")
 MODES = ["图片计数", "视频计数", "摄像头实时计数", "视觉—音频同步采集"]
+YOLO_TRACKING_LABEL = "YOLO person（人形追踪）"
+TENNIS_TRACKING_LABEL = "Tennis ball marker（网球标记追踪，推荐）"
+CUSTOM_OBJECT_TRACKING_LABEL = "指定物体（模板追踪，实验性）"
 TRACK_FIELDS = [
     "timestamp",
     "track_id",
@@ -384,18 +396,26 @@ def _browser_camera_counting(
     st.info(
         "如果要使用 iPhone Continuity Camera，请先允许浏览器使用默认摄像头，"
         "停止采集后点击 WebRTC 组件中的 Select Device，再选择名称包含 iPhone 的摄像头。"
+        "iPhone 没有出现只是可选设备暂时不可见，不影响 FaceTime 高清相机正常采集。"
     )
     with st.expander("浏览器看不到摄像头或 iPhone？"):
         st.markdown(
             "- 使用最新版 Chrome 或 Safari，并确认地址是 `localhost`。\n"
             "- 点击地址栏摄像头权限，先允许默认摄像头，再刷新页面。\n"
-            "- 确认 Mac 与 iPhone 使用同一 Apple ID，Wi-Fi、蓝牙和接力已开启。\n"
-            "- 浏览器设备列表由浏览器权限控制，Python 无法直接读取。"
+            "- 确认 iPhone 已解锁并靠近 Mac，Wi-Fi、蓝牙和接力已开启。\n"
+            "- 关闭可能占用摄像头的 FaceTime、Photo Booth 或 OBS。\n"
+            "- 若仍无 iPhone，可继续使用 FaceTime 高清相机；OBS Virtual Camera 是虚拟摄像头。\n"
+            "- 浏览器设备列表由浏览器权限控制，Python 无法直接读取或强制添加 iPhone。"
         )
     reset_key = "camera_browser_device_reset"
-    if st.button("重置浏览器设备选择", key="reset_browser_camera"):
+    if st.button(
+        "刷新浏览器摄像头设备 / 重新请求摄像头权限",
+        key="reset_browser_camera",
+    ):
         st.session_state[reset_key] = st.session_state.get(reset_key, 0) + 1
-        st.info("已清除本页面使用的旧设备选择。请重新点击 Start 并授权。")
+        st.info(
+            "已重建浏览器摄像头组件。请重新点击 Start、允许权限，再打开 Select Device。"
+        )
     component_generation = st.session_state.get(reset_key, 0)
     try:
         context = webrtc_streamer(
@@ -559,23 +579,45 @@ def _display_capture_artifacts(artifacts, acoustic_options: dict | None = None) 
 
 
 def _browser_fusion_capture(
-    confidence_threshold: float, person_only: bool, acoustic_options: dict | None
+    confidence_threshold: float,
+    person_only: bool,
+    acoustic_options: dict | None,
+    tracking_mode: str = "person_yolo",
+    object_tracker_config: dict | None = None,
 ) -> None:
     from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
     from src.browser_capture import FusionVideoProcessor
 
-    st.info("iPhone/Continuity Camera 用这条路径：浏览器选摄像头，本页选麦克风。")
+    if tracking_mode == "custom_object_template" and not object_tracker_config:
+        st.error("请先录入目标图像并初始化指定物体追踪。")
+        return
+    if tracking_mode == "tennis_ball_color" and not object_tracker_config:
+        st.error("请先测试并初始化网球标记追踪。")
+        return
+
+    st.info(
+        "iPhone/Continuity Camera 用这条路径：浏览器选摄像头，本页选麦克风。"
+        "设备列表由 macOS 和浏览器管理；iPhone 暂时不显示不会阻止其他摄像头采集。"
+    )
     with st.expander("看不到 iPhone 摄像头？"):
         st.markdown(
             "- 先点 WebRTC 组件里的 `Start`，允许浏览器摄像头权限。\n"
             "- 再点 `Select Device`，从浏览器设备列表里选 iPhone。\n"
-            "- 如果列表没有 iPhone，确认同一 Apple ID、Wi-Fi、蓝牙和接力已开启，然后刷新页面。"
+            "- 如果列表没有 iPhone，解锁并把 iPhone 靠近 Mac，确认 Wi-Fi、蓝牙和接力已开启。\n"
+            "- 关闭可能占用摄像头的 FaceTime、Photo Booth 和 OBS，再刷新页面。\n"
+            "- 确认 Safari/Chrome 已允许 localhost 使用摄像头。\n"
+            "- 仍不可见时可使用 FaceTime 高清相机，或切换到 OpenCV 本机摄像头模式。"
         )
     reset_key = "fusion_browser_device_reset"
-    if st.button("重置浏览器摄像头选择", key="reset_browser_fusion"):
+    if st.button(
+        "刷新浏览器摄像头设备 / 重新请求摄像头权限",
+        key="reset_browser_fusion",
+    ):
         st.session_state[reset_key] = st.session_state.get(reset_key, 0) + 1
-        st.info("已清除本页面使用的旧摄像头选择。请重新点击 Start 并授权。")
+        st.info(
+            "已重建浏览器摄像头组件。请重新点击 Start、允许权限，再打开 Select Device。"
+        )
     component_generation = st.session_state.get(reset_key, 0)
 
     st.markdown("**切换路径**")
@@ -605,8 +647,24 @@ def _browser_fusion_capture(
     )
 
     session = st.session_state.get("fusion_session")
-    if session is None or session.finalized:
-        session = SynchronizedCaptureSession(output_dir=OUTPUT_DIR)
+    if (
+        session is None
+        or session.finalized
+        or session.status().get("tracking_mode") != tracking_mode
+    ):
+        session = SynchronizedCaptureSession(
+            output_dir=OUTPUT_DIR,
+            tracking_mode=tracking_mode,
+            track_class=(
+                "custom_object"
+                if tracking_mode == "custom_object_template"
+                else (
+                    "tennis_ball_marker"
+                    if tracking_mode == "tennis_ball_color"
+                    else "person"
+                )
+            ),
+        )
         st.session_state.fusion_session = session
 
     try:
@@ -616,7 +674,11 @@ def _browser_fusion_capture(
             ),
             "mode": WebRtcMode.SENDRECV,
             "video_processor_factory": lambda: FusionVideoProcessor(
-                session, confidence_threshold, person_only
+                session,
+                confidence_threshold,
+                person_only,
+                tracking_mode=tracking_mode,
+                object_tracker_config=object_tracker_config,
             ),
             "media_stream_constraints": {
                 "video": {
@@ -640,6 +702,7 @@ def _browser_fusion_capture(
     db_slot = columns[2].empty()
     frequency_slot = columns[3].empty()
     sample_slot = st.empty()
+    tracking_slot = st.empty()
 
     was_playing = context.state.playing
     audio_worker = st.session_state.get(audio_worker_key)
@@ -658,18 +721,28 @@ def _browser_fusion_capture(
             st.session_state["browser_audio_device_last_audio_test"] = test_result
             if not test_result.get("ok"):
                 st.session_state.fusion_audio_start_error = test_result.get("error", "")
-                st.error("麦克风预检失败：" + st.session_state.fusion_audio_start_error)
-                return
-            try:
-                audio_worker = LocalAudioWorker(local_audio_device_index, session)
-                audio_worker.start(require_ready=True, timeout_sec=2.0)
-                st.session_state[audio_worker_key] = audio_worker
-                st.session_state.fusion_capture_active = True
-                st.success("音频流已就绪，开始视觉—音频同步采集。")
-            except Exception as exc:
-                st.session_state.fusion_audio_start_error = str(exc)
-                st.error(str(exc))
-                return
+                st.session_state.last_audio_error = (
+                    st.session_state.fusion_audio_start_error
+                )
+                st.warning(
+                    "音频采集异常，请重新选择麦克风或重启采集。"
+                    "浏览器视觉追踪仍可继续。错误："
+                    + st.session_state.fusion_audio_start_error
+                )
+            else:
+                try:
+                    audio_worker = LocalAudioWorker(local_audio_device_index, session)
+                    audio_worker.start(require_ready=True, timeout_sec=2.0)
+                    st.session_state[audio_worker_key] = audio_worker
+                    st.session_state.fusion_capture_active = True
+                    st.success("音频流已就绪，开始视觉—音频同步采集。")
+                except Exception as exc:
+                    st.session_state.fusion_audio_start_error = str(exc)
+                    st.session_state.last_audio_error = str(exc)
+                    st.warning(
+                        "音频采集异常，请重新选择麦克风或重启采集。"
+                        "浏览器视觉追踪仍可继续。错误：" + str(exc)
+                    )
         else:
             st.session_state.fusion_capture_active = True
         if audio_worker and audio_worker.audio_error:
@@ -694,6 +767,25 @@ def _browser_fusion_capture(
             f"视觉样本 {status['visual_samples']} 条｜音频样本 {status['audio_samples']} 条｜"
             f"已采集 {status['elapsed_sec']:.1f} 秒"
         )
+        if tracking_mode in ("custom_object_template", "tennis_ball_color"):
+            if status.get("tracking_status") == "lost":
+                message = (
+                    "网球目标暂时丢失；请调整 HSV 或将网球移回画面。"
+                    if tracking_mode == "tennis_ball_color"
+                    else "指定物体暂时丢失；请将物体移回 ROI 附近，必要时停止并重新初始化。"
+                )
+                tracking_slot.warning(message)
+            else:
+                tracking_label = (
+                    "视觉模式：Tennis ball marker track｜"
+                    if tracking_mode == "tennis_ball_color"
+                    else "视觉模式：Custom object track｜"
+                )
+                tracking_slot.caption(
+                    tracking_label
+                    + f"lost={status.get('lost_frame_count', 0)}｜"
+                    f"success={status.get('tracking_success_rate', 0.0):.1%}"
+                )
         time.sleep(0.1)
 
     should_finalize = (
@@ -799,6 +891,21 @@ def _audio_device_selector(key: str = "local_audio_device") -> int | None:
     devices_key = f"{key}_audio_devices"
     refresh_time_key = f"{key}_audio_refresh_time"
     choice_reason_key = f"{key}_audio_choice_reason"
+    other_selector = (
+        "browser_audio_device" if key == "local_audio_device" else "local_audio_device"
+    )
+    _stop_audio_level_monitor(other_selector)
+
+    def preferred_device(devices: list[dict]) -> tuple[dict | None, str]:
+        return find_preferred_input_device(
+            devices,
+            user_confirmed_index=st.session_state.get(
+                "user_confirmed_wireless_mic_index"
+            ),
+            user_confirmed_name=st.session_state.get(
+                "user_confirmed_wireless_mic_name"
+            ),
+        )
 
     def set_selection(
         index: int | None,
@@ -806,6 +913,9 @@ def _audio_device_selector(key: str = "local_audio_device") -> int | None:
         reason: str,
         update_widget: bool = True,
     ) -> None:
+        previous_index = st.session_state.get("selected_audio_input_index")
+        if previous_index is not None and index is not None and previous_index != index:
+            close_audio_resources()
         by_index = {item["index"]: item for item in devices}
         selected = by_index.get(index)
         if selected is None:
@@ -832,15 +942,20 @@ def _audio_device_selector(key: str = "local_audio_device") -> int | None:
         st.session_state[refresh_time_key] = datetime.now().strftime("%H:%M:%S")
         previous_index = st.session_state.get("selected_audio_input_index")
         available_indexes = {item["index"] for item in devices}
-        if previous_index in available_indexes:
+        preferred, reason = preferred_device(devices)
+        confirmed_match = preferred is not None and (
+            "用户确认" in reason or "重新匹配" in reason
+        )
+        if confirmed_match:
+            set_selection(preferred["index"], devices, reason)
+        elif previous_index in available_indexes:
             set_selection(previous_index, devices, "刷新后保留原选择 index")
         else:
-            preferred, reason = find_preferred_input_device(devices)
             set_selection(preferred["index"] if preferred else None, devices, reason)
 
     devices = st.session_state.get(devices_key, [])
-    if prefer_col.button("优先选择 Wireless Mic Rx", key=f"{key}_prefer_wireless"):
-        preferred, reason = find_preferred_input_device(devices)
+    if prefer_col.button("优先选择无线麦接收器", key=f"{key}_prefer_wireless"):
+        preferred, reason = preferred_device(devices)
         set_selection(preferred["index"] if preferred else None, devices, reason)
 
     st.caption(
@@ -858,7 +973,7 @@ def _audio_device_selector(key: str = "local_audio_device") -> int | None:
     available_indexes = [item["index"] for item in devices]
     current_index = st.session_state.get("selected_audio_input_index")
     if current_index not in available_indexes:
-        preferred, reason = find_preferred_input_device(devices)
+        preferred, reason = preferred_device(devices)
         set_selection(preferred["index"] if preferred else None, devices, reason)
     labels = {item["index"]: item["display_name"] for item in devices}
     default_index = get_default_input_device_index()
@@ -885,14 +1000,19 @@ def _audio_device_selector(key: str = "local_audio_device") -> int | None:
     )
     if st.session_state.get(choice_reason_key):
         st.info("当前选择原因：" + st.session_state[choice_reason_key])
-    if not any("wireless mic rx" in item["name"].casefold() for item in devices):
-        if any("usb audio codec" in item["name"].casefold() for item in devices):
+    selected_classification = classify_input_device(selected)
+    if not any(
+        classify_input_device(item)["is_exact_wireless_mic_rx"] for item in devices
+    ):
+        if any(classify_input_device(item)["is_usb_audio_codec"] for item in devices):
             st.warning(
-                "未枚举到 Wireless Mic Rx，但发现 USB audio CODEC。"
-                "部分无线麦克风接收器会以 USB audio CODEC 显示，可以先选择并测试它。"
+                "未枚举到精确名称 Wireless Mic Rx，但发现 USB audio CODEC。"
+                "它可能就是同一无线麦接收器的 PortAudio 名称，可直接测试输入电平。"
             )
         else:
             st.warning("未枚举到 Wireless Mic Rx。请点击刷新，或查看下方“麦克风诊断”建议。")
+    if selected_classification["is_possible_wireless_receiver"]:
+        st.caption("当前设备类型：" + selected_classification["friendly_type"])
     _render_audio_input_level(selected_index, key=f"{key}_level")
     return int(st.session_state["selected_audio_input_index"])
 
@@ -915,16 +1035,42 @@ def _stop_audio_level_monitor(selector_key: str) -> None:
 
 
 def _reset_audio_capture_state() -> None:
+    errors = close_audio_resources()
+    for selector_key in ("local_audio_device", "browser_audio_device"):
+        st.session_state.pop(f"{selector_key}_audio_devices", None)
+        st.session_state.pop(f"{selector_key}_last_audio_test", None)
+    st.session_state["last_audio_error"] = "；".join(errors)
+    st.session_state["fusion_audio_start_error"] = ""
+
+
+def close_audio_resources() -> list[str]:
+    """Best-effort close of every session-owned PortAudio stream."""
+    errors: list[str] = []
     for key in ("local_audio_device", "browser_audio_device"):
-        _stop_audio_level_monitor(key)
+        try:
+            _stop_audio_level_monitor(key)
+        except Exception as exc:
+            errors.append(str(exc))
     browser_worker = st.session_state.get("browser_fusion_audio_worker")
     if browser_worker is not None:
-        browser_worker.stop()
+        try:
+            browser_worker.close()
+        except Exception as exc:
+            errors.append(str(exc))
         st.session_state["browser_fusion_audio_worker"] = None
     local_worker = st.session_state.get("local_fusion_worker")
-    if local_worker is not None and not getattr(local_worker, "running", False):
-        st.session_state["local_fusion_worker"] = None
-    st.session_state["fusion_audio_start_error"] = ""
+    if local_worker is not None:
+        try:
+            local_worker.audio_capture.close()
+        except Exception as exc:
+            errors.append(str(exc))
+    session = st.session_state.get("fusion_session")
+    if session is not None:
+        try:
+            session.audio_recorder.close()
+        except Exception as exc:
+            errors.append(str(exc))
+    return errors
 
 
 def _microphone_diagnostics(
@@ -933,19 +1079,65 @@ def _microphone_diagnostics(
     capture_status: dict | None = None,
 ) -> None:
     with st.expander("麦克风诊断", expanded=False):
-        diagnostics = diagnose_audio_devices()
+        test_key = f"{selector_key}_last_audio_test"
+        test_result = st.session_state.get(test_key)
+        level_evidence: list[bool] = []
+        if test_result and test_result.get("device_index") == selected_index:
+            level_evidence.append(
+                bool(test_result.get("ok"))
+                and float(test_result.get("peak", 0.0) or 0.0) > 1e-6
+            )
+        monitor = st.session_state.get(f"{selector_key}_level_monitor")
+        if monitor is not None and monitor.audio_device_index == selected_index:
+            monitor_level = monitor.status()
+            level_evidence.append(float(monitor_level.get("peak", 0.0) or 0.0) > 1e-6)
+        if capture_status and capture_status.get("device_index") == selected_index:
+            level_evidence.append(
+                bool(capture_status.get("receiving"))
+                and float(capture_status.get("last_rms", 0.0) or 0.0) > 1e-7
+            )
+        selected_has_level = any(level_evidence) if level_evidence else None
+        diagnostics = diagnose_audio_devices(
+            selected_index=selected_index,
+            selected_device_has_level=selected_has_level,
+            user_confirmed_index=st.session_state.get(
+                "user_confirmed_wireless_mic_index"
+            ),
+            user_confirmed_name=st.session_state.get(
+                "user_confirmed_wireless_mic_name"
+            ),
+        )
         if not diagnostics["ok"]:
             st.error("sounddevice 诊断失败：" + diagnostics["error"])
             return
         devices = diagnostics["devices"]
-        selected_name = st.session_state.get(f"{selector_key}_selected_audio_input_name", "")
-        st.write(f"当前选择设备：`{selected_name or '--'}`")
-        st.write(f"当前选择 device index：`{selected_index}`")
+        selected_device = diagnostics["selected_device"]
+        selected_display = selected_device["display_name"] if selected_device else "--"
+        selected_type = diagnostics["selected_device_classification"]["friendly_type"]
+        st.write(f"当前选择设备：`{selected_display}`")
+        st.write(f"当前选择设备类型：`{selected_type}`")
+        st.write(f"当前选择设备可用：`{diagnostics['selected_device_available']}`")
+        level_text = "尚无电平数据" if selected_has_level is None else str(selected_has_level)
+        st.write(f"当前选择设备有输入电平：`{level_text}`")
         st.write(f"当前系统默认 input index：`{diagnostics['default_input_index']}`")
         st.write(f"sounddevice 版本：`{diagnostics['sounddevice_version']}`")
         st.write(f"sounddevice 默认设备：`{diagnostics['default_device']}`")
-        st.write(f"是否发现 Wireless Mic Rx：`{diagnostics['wireless_mic_rx_found']}`")
-        st.write(f"是否发现 USB audio CODEC：`{diagnostics['usb_audio_codec_found']}`")
+        st.write(
+            "最近一次音频错误：`"
+            + (st.session_state.get("last_audio_error") or "--")
+            + "`"
+        )
+        st.write(
+            "是否发现精确名称 Wireless Mic Rx："
+            f"`{diagnostics['found_exact_wireless_mic_rx']}`"
+        )
+        st.write(
+            "是否发现可能的无线麦接收器："
+            f"`{diagnostics['found_possible_wireless_receiver']}`"
+        )
+        st.write(
+            f"是否发现 USB audio CODEC：`{diagnostics['found_usb_audio_codec']}`"
+        )
         st.write(
             "推荐设备：`"
             + (
@@ -956,6 +1148,32 @@ def _microphone_diagnostics(
             + "`"
         )
         st.caption("推荐原因：" + diagnostics["recommendation_reason"])
+        if (
+            not diagnostics["found_exact_wireless_mic_rx"]
+            and diagnostics["found_usb_audio_codec"]
+        ):
+            st.warning(diagnostics["recommendation_message"])
+        else:
+            st.info(diagnostics["recommendation_message"])
+        if st.button(
+            "将当前设备作为我的 Wireless Mic Rx 使用",
+            key=f"{selector_key}_confirm_wireless",
+            disabled=selected_device is None,
+        ):
+            st.session_state["user_confirmed_wireless_mic_index"] = selected_index
+            st.session_state["user_confirmed_wireless_mic_name"] = (
+                selected_device["name"] if selected_device else ""
+            )
+            st.success(
+                f"已记住 {selected_device['name']} | index={selected_index}。"
+                "后续刷新和推荐会优先选择它。"
+            )
+        confirmed_index = st.session_state.get("user_confirmed_wireless_mic_index")
+        confirmed_name = st.session_state.get("user_confirmed_wireless_mic_name", "")
+        if confirmed_index is not None:
+            st.caption(
+                f"我的 Wireless Mic Rx：{confirmed_name} | index={confirmed_index}"
+            )
         refresh_time = st.session_state.get(f"{selector_key}_audio_refresh_time")
         if refresh_time:
             st.caption(f"页面最近刷新时间：{refresh_time}")
@@ -968,15 +1186,14 @@ def _microphone_diagnostics(
         for suggestion in diagnostics["suggestions"]:
             st.info(suggestion)
 
-        test_key = f"{selector_key}_last_audio_test"
         button_col, reset_col = st.columns(2)
         if button_col.button("测试当前麦克风 1 秒", key=f"{selector_key}_test_audio"):
             _stop_audio_level_monitor(selector_key)
             result = test_audio_input_device(selected_index, duration=1.0)
             st.session_state[test_key] = result
-        if reset_col.button("重新初始化麦克风状态", key=f"{selector_key}_reset_audio"):
+        if reset_col.button("重置音频采集状态", key=f"{selector_key}_reset_audio"):
             _reset_audio_capture_state()
-            st.success("已关闭旧音频流并清理麦克风状态。")
+            st.success("已关闭旧音频流、清理状态；页面重新运行后会重新枚举设备。")
 
         test_result = st.session_state.get(test_key)
         if test_result:
@@ -987,6 +1204,17 @@ def _microphone_diagnostics(
                     f"{test_result['sample_rate']} Hz | "
                     f"RMS {test_result['rms']:.5f} | {test_result['db']:.1f} dBFS"
                 )
+                selected_classification = classify_input_device(
+                    {"name": test_result.get("device_name", "")}
+                )
+                if (
+                    selected_classification["is_usb_audio_codec"]
+                    and float(test_result.get("peak", 0.0) or 0.0) > 1e-6
+                ):
+                    st.info(
+                        "当前 USB audio CODEC 可能就是 Wireless Mic Rx 的 "
+                        "PortAudio 名称。"
+                    )
             else:
                 st.error("最近测试失败：" + str(test_result.get("error", "")))
 
@@ -1061,10 +1289,28 @@ def _render_local_fusion_worker(worker_key: str) -> None:
     columns[3].metric(
         "主频", f"{audio['dominant_frequency_hz']:.1f} Hz" if audio else "--"
     )
+    backend = (
+        f"{status.get('object_tracker_type') or 'tracker'}"
+        if status.get("tracking_mode") in ("custom_object_template", "tennis_ball_color")
+        else status["backend"]
+    )
     st.caption(
-        f"检测后端：{status['backend']}｜视觉样本 {status['visual_samples']} 条｜"
+        f"检测后端：{backend}｜视觉样本 {status['visual_samples']} 条｜"
         f"音频样本 {status['audio_samples']} 条｜已采集 {status['elapsed_sec']:.1f} 秒"
     )
+    if status.get("tracking_mode") in ("custom_object_template", "tennis_ball_color"):
+        if status.get("object_tracking_status") == "lost":
+            st.warning(
+                "网球目标暂时丢失。"
+                if status.get("tracking_mode") == "tennis_ball_color"
+                else "目标暂时丢失。"
+            )
+        if status.get("consecutive_lost_frames", 0) >= 30:
+            st.error(
+                "网球已连续丢失 30 帧以上，建议停止采集并调整 HSV 或重新初始化。"
+                if status.get("tracking_mode") == "tennis_ball_color"
+                else "指定物体已连续丢失 30 帧以上，建议停止采集并重新初始化目标。"
+            )
     audio_capture = status.get("audio_capture", {})
     if audio_capture:
         st.caption(
@@ -1088,7 +1334,11 @@ def _render_local_fusion_worker(worker_key: str) -> None:
 
 
 def _local_fusion_capture(
-    confidence_threshold: float, person_only: bool, acoustic_options: dict | None
+    confidence_threshold: float,
+    person_only: bool,
+    acoustic_options: dict | None,
+    tracking_mode: str = "person_yolo",
+    object_tracker_config: dict | None = None,
 ) -> None:
     st.info("本机固定实验用这条路径：下方选择 OpenCV 摄像头和 sounddevice 麦克风。")
     camera_index = _camera_index_controls("fusion")
@@ -1116,8 +1366,21 @@ def _local_fusion_capture(
     if start_col.button(
         "开始同步采集",
         type="primary",
-        disabled=bool(worker and worker.running) or audio_device_index is None,
+        disabled=(
+            bool(worker and worker.running)
+            or audio_device_index is None
+            or (
+                tracking_mode in ("custom_object_template", "tennis_ball_color")
+                and not object_tracker_config
+            )
+        ),
     ):
+        if tracking_mode == "custom_object_template" and not object_tracker_config:
+            st.error("请先录入目标图像并初始化指定物体追踪。")
+            return
+        if tracking_mode == "tennis_ball_color" and not object_tracker_config:
+            st.error("请先测试并初始化网球标记追踪。")
+            return
         checks = _run_local_preflight(camera_index, audio_device_index)
         st.session_state.local_preflight_checks = checks
         camera_ok = next(ok for label, ok, _ in checks if label == "摄像头")
@@ -1132,8 +1395,11 @@ def _local_fusion_capture(
                 audio_test = test_audio_input_device(audio_device_index, duration=1.0)
                 st.session_state["local_audio_device_last_audio_test"] = audio_test
                 if not audio_test.get("ok"):
-                    st.error("麦克风预检失败：" + str(audio_test.get("error", "")))
-                    return
+                    st.session_state.last_audio_error = str(audio_test.get("error", ""))
+                    st.warning(
+                        "麦克风预检失败，将尝试有限设备回退；即使音频不可用，"
+                        "视觉追踪仍会启动。错误：" + str(audio_test.get("error", ""))
+                    )
                 if worker is not None:
                     worker.stop()
                 worker = LocalFusionWorker(
@@ -1142,11 +1408,21 @@ def _local_fusion_capture(
                     output_dir=OUTPUT_DIR,
                     confidence_threshold=confidence_threshold,
                     person_only=person_only,
+                    tracking_mode=tracking_mode,
+                    object_tracker_config=object_tracker_config,
                 )
                 worker.start()
                 st.session_state[worker_key] = worker
-                st.success("音频流已就绪，开始视觉—音频同步采集。")
+                if worker.audio_error:
+                    st.session_state.last_audio_error = worker.audio_error
+                    st.warning(
+                        "音频采集异常，请重新选择麦克风或重启采集；"
+                        "视觉追踪已继续运行。错误：" + worker.audio_error
+                    )
+                else:
+                    st.success("音频流已就绪，开始视觉—音频同步采集。")
             except Exception as exc:
+                st.session_state.last_audio_error = str(exc)
                 st.error(f"无法开始同步采集：{exc}")
 
     can_finalize = bool(worker and not worker.session.finalized)
@@ -1172,7 +1448,7 @@ def _local_fusion_capture(
 
 
 def _acoustic_export_controls() -> dict:
-    with st.expander("声学轨迹导出设置", expanded=True):
+    with st.expander("声学轨迹导出设置", expanded=False):
         export = st.checkbox("导出声学轨迹 PNG", value=True)
         metric = st.selectbox(
             "优先显示指标",
@@ -1207,9 +1483,411 @@ def _acoustic_export_controls() -> dict:
     }
 
 
+def _store_object_template(frame, signature: str) -> None:
+    st.session_state.custom_object_template_frame = frame.copy()
+    st.session_state.custom_object_template_signature = signature
+    st.session_state.custom_object_tracker_ready = False
+    st.session_state.custom_object_tracker_config = None
+    height, width = frame.shape[:2]
+    st.session_state.custom_roi_x = max(0, width // 4)
+    st.session_state.custom_roi_y = max(0, height // 4)
+    st.session_state.custom_roi_width = max(1, width // 2)
+    st.session_state.custom_roi_height = max(1, height // 2)
+
+
+def _store_tennis_template(frame, signature: str) -> None:
+    st.session_state.tennis_template_frame = frame.copy()
+    st.session_state.tennis_template_signature = signature
+    st.session_state.tennis_tracker_ready = False
+    st.session_state.tennis_tracker_config = None
+    height, width = frame.shape[:2]
+    st.session_state.tennis_roi_x = max(0, width // 4)
+    st.session_state.tennis_roi_y = max(0, height // 4)
+    st.session_state.tennis_roi_width = max(1, width // 2)
+    st.session_state.tennis_roi_height = max(1, height // 2)
+
+
+def _tennis_tracking_advanced_controls() -> tuple[str, dict | None]:
+    source = st.radio(
+        "网球颜色参数来源",
+        [
+            "使用默认网球颜色阈值",
+            "从当前 OpenCV 摄像头画面截帧并估计",
+            "上传包含网球的图片并估计",
+        ],
+        horizontal=True,
+        key="tennis_template_source",
+    )
+    camera_index = int(st.session_state.get("fusion_camera_index", 0))
+    if source.startswith("从当前"):
+        st.caption(f"将从 OpenCV Camera {camera_index} 截取一帧用于 ROI 设置。")
+        if st.button("截取网球当前帧", key="capture_tennis_template"):
+            try:
+                frame = read_camera_preview(camera_index)
+                _store_tennis_template(frame, f"camera-{camera_index}-{time.time_ns()}")
+                st.success("已截取当前帧，请把 ROI 调整到网球区域。")
+            except Exception as exc:
+                st.error(f"网球当前帧截取失败：{exc}")
+    elif source.startswith("上传"):
+        uploaded = st.file_uploader(
+            "上传包含网球的图片（建议与采集机位相同）",
+            type=["jpg", "jpeg", "png", "bmp"],
+            key="tennis_template_upload",
+        )
+        if uploaded is not None:
+            signature = f"{uploaded.name}-{uploaded.size}"
+            if st.session_state.get("tennis_template_signature") != signature:
+                data = np.frombuffer(uploaded.getvalue(), dtype=np.uint8)
+                frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                if frame is None:
+                    st.error("无法读取网球图片。")
+                else:
+                    _store_tennis_template(frame, signature)
+
+    template = st.session_state.get("tennis_template_frame")
+    if template is not None:
+        frame_height, frame_width = template.shape[:2]
+        for key, upper in (
+            ("tennis_roi_x", max(0, frame_width - 1)),
+            ("tennis_roi_y", max(0, frame_height - 1)),
+            ("tennis_roi_width", frame_width),
+            ("tennis_roi_height", frame_height),
+        ):
+            current = int(
+                st.session_state.get(key, 0 if key.endswith(("_x", "_y")) else 1)
+            )
+            st.session_state[key] = min(
+                max(current, 0 if key.endswith(("_x", "_y")) else 1), upper
+            )
+        st.markdown("**网球 ROI 设置（图片像素坐标）**")
+        columns = st.columns(4)
+        roi_x = columns[0].number_input(
+            "ROI x", min_value=0, max_value=max(0, frame_width - 1), key="tennis_roi_x"
+        )
+        roi_y = columns[1].number_input(
+            "ROI y", min_value=0, max_value=max(0, frame_height - 1), key="tennis_roi_y"
+        )
+        max_width = max(1, frame_width - int(roi_x))
+        max_height = max(1, frame_height - int(roi_y))
+        if st.session_state.tennis_roi_width > max_width:
+            st.session_state.tennis_roi_width = max_width
+        if st.session_state.tennis_roi_height > max_height:
+            st.session_state.tennis_roi_height = max_height
+        roi_width = columns[2].number_input(
+            "ROI width", min_value=1, max_value=max_width, key="tennis_roi_width"
+        )
+        roi_height = columns[3].number_input(
+            "ROI height", min_value=1, max_value=max_height, key="tennis_roi_height"
+        )
+        bbox = (int(roi_x), int(roi_y), int(roi_width), int(roi_height))
+        preview = template.copy()
+        cv2.rectangle(
+            preview,
+            (bbox[0], bbox[1]),
+            (bbox[0] + bbox[2], bbox[1] + bbox[3]),
+            (0, 255, 0),
+            3,
+        )
+        st.image(
+            cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
+            caption=f"网球 ROI 预览 | {frame_width}x{frame_height}",
+            width=640,
+        )
+    else:
+        bbox = None
+        st.caption(
+            "默认阈值可以直接用于实时采集；若要自动估计颜色，请先截帧或上传图片。"
+        )
+
+    hsv_defaults = {
+        "tennis_h_range": (DEFAULT_HSV_LOWER[0], DEFAULT_HSV_UPPER[0]),
+        "tennis_s_range": (DEFAULT_HSV_LOWER[1], DEFAULT_HSV_UPPER[1]),
+        "tennis_v_range": (DEFAULT_HSV_LOWER[2], DEFAULT_HSV_UPPER[2]),
+    }
+    for key, value in hsv_defaults.items():
+        st.session_state.setdefault(key, value)
+
+    if template is not None and bbox is not None and st.button(
+        "从 ROI 自动估计 HSV", key="estimate_tennis_hsv"
+    ):
+        try:
+            lower, upper = estimate_hsv_range_from_roi(template, bbox)
+            st.session_state.tennis_h_range = (lower[0], upper[0])
+            st.session_state.tennis_s_range = (lower[1], upper[1])
+            st.session_state.tennis_v_range = (lower[2], upper[2])
+            st.session_state.tennis_hsv_estimated = (lower, upper)
+            st.success(f"已估计 HSV：lower={lower}，upper={upper}")
+        except Exception as exc:
+            st.error(f"HSV 估计失败：{exc}")
+
+    st.markdown("**HSV 阈值（OpenCV H 范围为 0–179）**")
+    hsv_columns = st.columns(3)
+    h_range = hsv_columns[0].slider("H min / max", 0, 179, key="tennis_h_range")
+    s_range = hsv_columns[1].slider("S min / max", 0, 255, key="tennis_s_range")
+    v_range = hsv_columns[2].slider("V min / max", 0, 255, key="tennis_v_range")
+    min_area = st.number_input(
+        "网球最小面积", min_value=1.0, max_value=1_000_000.0, value=80.0, step=10.0,
+        key="tennis_min_area",
+    )
+    max_area = st.number_input(
+        "网球最大面积", min_value=2.0, max_value=2_000_000.0, value=50_000.0, step=100.0,
+        key="tennis_max_area",
+    )
+    min_circularity = st.slider(
+        "最小圆度", 0.05, 1.0, 0.45, 0.05, key="tennis_min_circularity"
+    )
+    hsv_lower = (int(h_range[0]), int(s_range[0]), int(v_range[0]))
+    hsv_upper = (int(h_range[1]), int(s_range[1]), int(v_range[1]))
+    params = {
+        "hsv_lower": hsv_lower,
+        "hsv_upper": hsv_upper,
+        "min_area": float(min_area),
+        "max_area": float(max_area),
+        "min_circularity": float(min_circularity),
+        "smoothing": 0.35,
+        "max_lost_frames": 30,
+    }
+
+    if template is not None:
+        mask = make_tennis_mask(template, hsv_lower, hsv_upper)
+        st.image(mask, caption="当前 HSV mask 预览（白色为候选区域）", clamp=True, width=640)
+    else:
+        st.caption("mask 预览需要先截取或上传一张包含网球的图片。")
+
+    if st.button("测试网球识别", key="test_tennis_tracker"):
+        try:
+            test_frame = template
+            if test_frame is None:
+                test_frame = read_camera_preview(camera_index)
+                _store_tennis_template(test_frame, f"test-camera-{time.time_ns()}")
+            tracker = TennisBallTracker(**params)
+            result = tracker.update(test_frame)
+            st.session_state.tennis_last_test = {
+                "result": result,
+                "params": params.copy(),
+            }
+        except Exception as exc:
+            st.session_state.tennis_last_test = {
+                "result": {"ok": False, "status": "lost", "error": str(exc)},
+                "params": params.copy(),
+            }
+    last_test = st.session_state.get("tennis_last_test")
+    if last_test and last_test.get("params") == params:
+        result = last_test["result"]
+        if result.get("ok"):
+            st.success(
+                "网球识别成功："
+                f"center=({result['center_x']:.1f}, {result['center_y']:.1f})，"
+                f"radius={result['marker_radius']:.1f}，area={result['marker_area']:.1f}，"
+                f"circularity={result['marker_circularity']:.2f}，status=tracking"
+            )
+        else:
+            st.warning("当前帧没有识别到网球，请调整 HSV、面积或圆度阈值后重试。")
+    elif last_test:
+        st.caption("HSV 或筛选参数已变化，请重新测试网球识别。")
+
+    if st.button("初始化网球追踪", type="primary", key="initialize_tennis_tracker"):
+        if not last_test or last_test.get("params") != params or not last_test.get("result", {}).get("ok"):
+            st.error("请先测试并成功识别网球标记。")
+        else:
+            st.session_state.tennis_tracker_config = params.copy()
+            st.session_state.tennis_tracker_ready = True
+            st.success(
+                "网球标记追踪已就绪：tracking_mode=tennis_ball_color，"
+                "track_id=1，状态=ready。"
+            )
+
+    config = st.session_state.get("tennis_tracker_config")
+    if config and config != params:
+        st.session_state.tennis_tracker_ready = False
+        st.session_state.tennis_tracker_config = None
+        config = None
+        st.warning("HSV 或筛选参数已变化，请重新测试并初始化网球追踪。")
+    if st.session_state.get("tennis_tracker_ready") and config:
+        st.caption("当前网球追踪配置已就绪，正式 START 将使用这些 HSV 和筛选参数。")
+        return "tennis_ball_color", dict(config)
+    st.error("请先测试并初始化网球标记追踪，之后才能 START。")
+    return "tennis_ball_color", None
+
+
+def _tennis_tracking_controls() -> tuple[str, dict | None]:
+    st.info(
+        "当前使用网球颜色标记追踪。若识别稳定，通常无需展开高级参数。"
+        "该模式使用 HSV 颜色分割，不受 YOLO person 过滤影响。"
+    )
+    with st.expander("网球颜色与识别高级参数", expanded=False):
+        return _tennis_tracking_advanced_controls()
+
+
+def _object_tracking_controls() -> tuple[str, dict | None]:
+    target_label = st.radio(
+        "视觉追踪目标类型",
+        [
+            YOLO_TRACKING_LABEL,
+            TENNIS_TRACKING_LABEL,
+            CUSTOM_OBJECT_TRACKING_LABEL,
+        ],
+        index=None,
+        horizontal=True,
+        key="fusion_tracking_target_type",
+    )
+    if target_label.startswith("YOLO"):
+        return "person_yolo", None
+    if target_label.startswith("Tennis"):
+        return _tennis_tracking_controls()
+
+    st.warning(
+        "指定物体追踪适合颜色、形状或纹理明显的物体。遮挡、快速旋转、"
+        "尺度或光照变化可能导致丢失。麦克风等小物体建议贴明显颜色标记；"
+        "更稳定的后续方案可考虑 ArUco marker 或 Siamese tracker。"
+    )
+    source = st.radio(
+        "目标录入方式",
+        ["使用当前 OpenCV 摄像头画面截帧", "上传目标模板图片"],
+        horizontal=True,
+        key="custom_object_template_source",
+    )
+    if source.startswith("使用当前"):
+        camera_index = int(st.session_state.get("fusion_camera_index", 0))
+        st.caption(
+            f"将从 OpenCV Camera {camera_index} 截帧。浏览器/iPhone 模式建议上传同一机位的完整首帧。"
+        )
+        if st.button("截取当前帧作为模板", key="capture_custom_object_template"):
+            try:
+                frame = read_camera_preview(camera_index)
+                _store_object_template(frame, f"camera-{camera_index}-{time.time_ns()}")
+                st.success("已截取当前摄像头画面。请设置 ROI。")
+            except Exception as exc:
+                st.error(f"目标模板截帧失败：{exc}")
+    else:
+        uploaded = st.file_uploader(
+            "上传目标模板图片（建议使用与采集相同机位的完整画面）",
+            type=["jpg", "jpeg", "png", "bmp"],
+            key="custom_object_template_upload",
+        )
+        if uploaded is not None:
+            signature = f"{uploaded.name}-{uploaded.size}"
+            if st.session_state.get("custom_object_template_signature") != signature:
+                data = np.frombuffer(uploaded.getvalue(), dtype=np.uint8)
+                frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                if frame is None:
+                    st.error("无法读取目标模板图片。")
+                else:
+                    _store_object_template(frame, signature)
+
+    template = st.session_state.get("custom_object_template_frame")
+    if template is None:
+        st.info("请先截取当前帧或上传目标模板图片。")
+        return "custom_object_template", None
+
+    frame_height, frame_width = template.shape[:2]
+    for key, upper in (
+        ("custom_roi_x", max(0, frame_width - 1)),
+        ("custom_roi_y", max(0, frame_height - 1)),
+        ("custom_roi_width", frame_width),
+        ("custom_roi_height", frame_height),
+    ):
+        current = int(st.session_state.get(key, 0 if key.endswith(("_x", "_y")) else 1))
+        st.session_state[key] = min(max(current, 0 if key.endswith(("_x", "_y")) else 1), upper)
+
+    st.markdown("**ROI 设置（模板图像像素坐标）**")
+    columns = st.columns(4)
+    roi_x = columns[0].number_input(
+        "ROI x", min_value=0, max_value=max(0, frame_width - 1), key="custom_roi_x"
+    )
+    roi_y = columns[1].number_input(
+        "ROI y", min_value=0, max_value=max(0, frame_height - 1), key="custom_roi_y"
+    )
+    max_width = max(1, frame_width - int(roi_x))
+    max_height = max(1, frame_height - int(roi_y))
+    if st.session_state.custom_roi_width > max_width:
+        st.session_state.custom_roi_width = max_width
+    if st.session_state.custom_roi_height > max_height:
+        st.session_state.custom_roi_height = max_height
+    roi_width = columns[2].number_input(
+        "ROI width", min_value=1, max_value=max_width, key="custom_roi_width"
+    )
+    roi_height = columns[3].number_input(
+        "ROI height", min_value=1, max_value=max_height, key="custom_roi_height"
+    )
+    bbox = (int(roi_x), int(roi_y), int(roi_width), int(roi_height))
+    preview = template.copy()
+    cv2.rectangle(
+        preview,
+        (bbox[0], bbox[1]),
+        (bbox[0] + bbox[2], bbox[1] + bbox[3]),
+        (0, 255, 0),
+        3,
+    )
+    st.image(
+        cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
+        caption=f"目标模板与 ROI | {frame_width}x{frame_height}",
+        width=640,
+    )
+    requested_tracker = st.selectbox(
+        "OpenCV tracker（不可用时自动回退）",
+        ["CSRT", "KCF", "MIL"],
+        key="custom_object_tracker_type",
+    )
+    if st.button(
+        "初始化指定物体追踪",
+        type="primary",
+        key="initialize_custom_object_tracker",
+    ):
+        try:
+            validate_bbox(template, bbox)
+            tracker = ObjectTemplateTracker(requested_tracker)
+            initialized = tracker.initialize(template, bbox)
+        except Exception as exc:
+            initialized = False
+            tracker = None
+            st.error(f"指定物体追踪初始化失败：{exc}")
+        if initialized and tracker is not None:
+            config = {
+                "tracker_type": requested_tracker,
+                "actual_tracker_type": tracker.actual_tracker_type,
+                "bbox": bbox,
+                "template_size": (frame_width, frame_height),
+                "template_signature": st.session_state.get(
+                    "custom_object_template_signature", ""
+                ),
+            }
+            st.session_state.custom_object_tracker_config = config
+            st.session_state.custom_object_tracker_ready = True
+            st.success(
+                "指定物体追踪已就绪："
+                f"tracker={tracker.actual_tracker_type}，bbox={bbox}，"
+                "object track_id=1，状态=ready。"
+            )
+        elif tracker is not None:
+            st.session_state.custom_object_tracker_ready = False
+            st.session_state.custom_object_tracker_config = None
+            st.error("指定物体追踪初始化失败：" + tracker.last_error)
+
+    config = st.session_state.get("custom_object_tracker_config")
+    current_signature = st.session_state.get("custom_object_template_signature", "")
+    if config and (
+        tuple(config.get("bbox", ())) != bbox
+        or config.get("template_signature") != current_signature
+        or config.get("tracker_type") != requested_tracker
+    ):
+        st.session_state.custom_object_tracker_ready = False
+        st.warning("模板或 ROI 已变化，请重新点击“初始化指定物体追踪”。")
+        config = None
+    if st.session_state.get("custom_object_tracker_ready") and config:
+        st.success(
+            "当前指定物体配置已就绪："
+            f"{config['actual_tracker_type']} | bbox={tuple(config['bbox'])} | track_id=1"
+        )
+        return "custom_object_template", dict(config)
+    st.error("请先录入目标图像并初始化指定物体追踪。")
+    return "custom_object_template", None
+
+
 def fusion_capture_mode(confidence_threshold: float, person_only: bool) -> None:
     st.subheader("视觉—音频同步采集")
     acoustic_options = _acoustic_export_controls()
+    tracking_mode, object_tracker_config = _object_tracking_controls()
     source = st.radio(
         "采集方式",
         [
@@ -1219,10 +1897,29 @@ def fusion_capture_mode(confidence_threshold: float, person_only: bool) -> None:
         horizontal=True,
         key="fusion_capture_source",
     )
+    previous_source = st.session_state.get("active_fusion_capture_source")
+    if previous_source is not None and previous_source != source:
+        close_audio_resources()
+        local_worker = st.session_state.get("local_fusion_worker")
+        if local_worker is not None and getattr(local_worker, "running", False):
+            local_worker.stop()
+    st.session_state["active_fusion_capture_source"] = source
     if source.startswith("浏览器"):
-        _browser_fusion_capture(confidence_threshold, person_only, acoustic_options)
+        _browser_fusion_capture(
+            confidence_threshold,
+            person_only,
+            acoustic_options,
+            tracking_mode,
+            object_tracker_config,
+        )
     else:
-        _local_fusion_capture(confidence_threshold, person_only, acoustic_options)
+        _local_fusion_capture(
+            confidence_threshold,
+            person_only,
+            acoustic_options,
+            tracking_mode,
+            object_tracker_config,
+        )
 
 
 def _stop_inactive_local_workers(mode: str) -> None:
@@ -1287,6 +1984,14 @@ def _render_device_diagnostics(detector: Detector) -> None:
             "浏览器设备列表由浏览器权限控制，需先授权，再由 WebRTC 组件的 "
             "Select Device 显示。"
         )
+        st.markdown(
+            "**摄像头诊断建议**\n\n"
+            "- iPhone Continuity Camera 可能需要解锁 iPhone、靠近 Mac，并开启蓝牙、Wi-Fi 和接力。\n"
+            "- Select Device 中没有 iPhone 时，刷新页面并关闭 FaceTime、Photo Booth 或 OBS。\n"
+            "- FaceTime 高清相机可作为稳定备用。\n"
+            "- OBS Virtual Camera 是虚拟摄像头，不是 iPhone 摄像头。\n"
+            "- iPhone 不可见只是诊断提示，不代表浏览器摄像头采集失败。"
+        )
         st.info(
             "推荐：iPhone Continuity Camera 使用浏览器模式；固定本地实验使用 "
             "OpenCV + sounddevice。"
@@ -1300,11 +2005,37 @@ def main() -> None:
 
     mode = st.sidebar.radio("功能模式", MODES)
     _stop_inactive_local_workers(mode)
+    if mode == "视觉—音频同步采集":
+        st.session_state.setdefault(
+            "fusion_tracking_target_type", TENNIS_TRACKING_LABEL
+        )
+        if st.session_state.fusion_tracking_target_type == "YOLO person（人形追踪，默认）":
+            st.session_state.fusion_tracking_target_type = YOLO_TRACKING_LABEL
+    fusion_tracking_label = st.session_state.get(
+        "fusion_tracking_target_type", TENNIS_TRACKING_LABEL
+    )
     st.sidebar.subheader("检测设置")
     confidence_threshold = st.sidebar.slider(
         "conf 阈值", min_value=0.1, max_value=0.9, value=0.25, step=0.05
     )
-    person_only = st.sidebar.checkbox("只检测 person", value=True)
+    if (
+        mode == "视觉—音频同步采集"
+        and fusion_tracking_label != YOLO_TRACKING_LABEL
+    ):
+        person_only = True
+        if fusion_tracking_label == TENNIS_TRACKING_LABEL:
+            st.sidebar.caption(
+                "当前视觉追踪模式为 Tennis ball marker：使用颜色分割追踪网球，"
+                "不使用 YOLO person 过滤。"
+            )
+        else:
+            st.sidebar.caption(
+                "当前视觉追踪模式为指定物体模板追踪，不使用 YOLO person 过滤。"
+            )
+    else:
+        person_only = st.sidebar.checkbox(
+            "只检测 person", value=True, key="yolo_person_only"
+        )
     detector = get_detector(confidence_threshold, person_only)
     st.sidebar.metric("检测后端", detector.backend_name)
     st.sidebar.caption(

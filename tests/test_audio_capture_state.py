@@ -38,12 +38,19 @@ def test_sounddevice_capture_state_and_close(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.setitem(sys.modules, "sounddevice", FakeSoundDevice)
     monkeypatch.setattr(
         local_capture,
+        "build_input_device_fallback_indices",
+        lambda index: [index],
+    )
+    monkeypatch.setattr(
+        local_capture,
         "check_audio_input_device",
         lambda index: {
             "index": index,
             "name": "Wireless Mic Rx",
             "sample_rate": 48_000,
             "channels": 1,
+            "default_samplerate": 48_000.0,
+            "max_input_channels": 1,
         },
     )
     session = SynchronizedCaptureSession(output_dir=tmp_path)

@@ -42,9 +42,29 @@ def _style_axes(axis: plt.Axes) -> None:
     axis.set_aspect("equal", adjustable="datalim")
 
 
+def _tracking_subject(frame: pd.DataFrame) -> str:
+    if "tracking_mode" not in frame.columns:
+        return "person"
+    modes = frame["tracking_mode"].astype(str)
+    if modes.eq("tennis_ball_color").any():
+        return "tennis"
+    if modes.eq("custom_object_template").any():
+        return "custom"
+    return "person"
+
+
+def _tracking_subject_csv(csv_path: str | Path) -> str:
+    try:
+        frame = pd.read_csv(csv_path, usecols=["tracking_mode"])
+    except (ValueError, OSError):
+        return "person"
+    return _tracking_subject(frame)
+
+
 def plot_trajectory(csv_path: str | Path) -> Path:
     """Plot center_x/center_y movement and save it under data/output/."""
     frame = _load_matched(csv_path)
+    subject = _tracking_subject_csv(csv_path)
     output = _output_path(csv_path, "trajectory")
     figure, axis = plt.subplots(figsize=(8, 6), constrained_layout=True)
     if frame.empty:
@@ -66,8 +86,16 @@ def plot_trajectory(csv_path: str | Path) -> Path:
         figure.colorbar(rendered, ax=axis, label="Elapsed time (seconds)")
         axis.scatter(frame.iloc[0]["center_x"], frame.iloc[0]["center_y"], c="green", s=80, label="Start")
         axis.scatter(frame.iloc[-1]["center_x"], frame.iloc[-1]["center_y"], c="red", s=80, label="End")
-        axis.legend()
-    axis.set_title("Tracked Person Trajectory")
+        legend_title = {
+            "tennis": "Tennis ball marker track",
+            "custom": "Custom object track",
+        }.get(subject)
+        axis.legend(title=legend_title)
+    axis.set_title({
+        "tennis": "Tennis Ball Marker Trajectory",
+        "custom": "Custom Object Trajectory",
+        "person": "Tracked Person Trajectory",
+    }[subject])
     _style_axes(axis)
     figure.savefig(output, dpi=160)
     plt.close(figure)
@@ -83,6 +111,7 @@ def _plot_spatial_values(
     cmap: str,
 ) -> Path:
     frame = _load_matched(csv_path, value_column)
+    subject = _tracking_subject_csv(csv_path)
     output = _output_path(csv_path, suffix)
     figure, axis = plt.subplots(figsize=(8, 6), constrained_layout=True)
 
@@ -107,7 +136,12 @@ def _plot_spatial_values(
             axis.scatter(x, y, c=values, cmap=cmap, s=12, edgecolors="none")
         figure.colorbar(rendered, ax=axis, label=colorbar_label)
 
-    axis.set_title(title)
+    subject_label = {
+        "tennis": "Tennis Ball Marker",
+        "custom": "Custom Object",
+        "person": "Tracked Person",
+    }[subject]
+    axis.set_title(f"{subject_label} | {title}")
     _style_axes(axis)
     figure.savefig(output, dpi=160)
     plt.close(figure)

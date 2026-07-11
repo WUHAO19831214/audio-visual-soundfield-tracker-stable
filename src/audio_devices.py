@@ -32,6 +32,54 @@ PREFERRED_INPUT_KEYWORDS = [
 ]
 
 
+def normalize_device_name(name: Any) -> str:
+    """Normalize a Core Audio/PortAudio label for stable matching."""
+    return " ".join(str(name or "").casefold().split())
+
+
+def classify_input_device(device: dict | str) -> dict:
+    """Classify an input label without assuming macOS and PortAudio agree."""
+    raw_name = device.get("name", "") if isinstance(device, dict) else device
+    name = normalize_device_name(raw_name)
+    compact_name = name.replace(" ", "")
+    is_blackhole = any(token in name for token in ("blackhole", "obs", "virtual"))
+    is_usb_audio_codec = "usb audio codec" in name
+    is_exact_wireless = "wireless mic rx" in name
+    possible_keywords = (
+        "wireless",
+        "mic rx",
+        "usb audio codec",
+        "usb microphone",
+        "external microphone",
+    )
+    is_possible_wireless = not is_blackhole and any(
+        token in name for token in possible_keywords
+    )
+    is_builtin = not is_blackhole and not is_possible_wireless and (
+        "macbookair麦克风" in compact_name
+        or "built-in" in name
+        or ("microphone" in name and "usb" not in name)
+    )
+    if is_exact_wireless:
+        friendly_type = "Wireless Mic Rx（精确名称）"
+    elif is_possible_wireless:
+        friendly_type = "可能的无线麦克风接收器"
+    elif is_builtin:
+        friendly_type = "内置麦克风"
+    elif is_blackhole:
+        friendly_type = "虚拟声卡"
+    else:
+        friendly_type = "其他输入设备"
+    return {
+        "is_exact_wireless_mic_rx": is_exact_wireless,
+        "is_possible_wireless_receiver": is_possible_wireless,
+        "is_usb_audio_codec": is_usb_audio_codec,
+        "is_builtin_mic": is_builtin,
+        "is_blackhole": is_blackhole,
+        "friendly_type": friendly_type,
+    }
+
+
 def _default_input_index_from_sounddevice(sd: Any) -> int | None:
     """Resolve sounddevice's [input, output] default pair to an input index."""
     try:
@@ -118,14 +166,46 @@ def get_default_input_device_index() -> int | None:
     return int(devices[0]["index"]) if devices else None
 
 
+def build_input_device_fallback_indices(selected_index: int | None) -> list[int]:
+    """Return a finite selected/default/built-in fallback order."""
+    devices = list_audio_input_devices(force_refresh=True)
+    available = {int(device["index"]): device for device in devices}
+    candidates: list[int] = []
+
+    def add(index: int | None) -> None:
+        if index is not None and int(index) in available and int(index) not in candidates:
+            candidates.append(int(index))
+
+    add(selected_index)
+    add(get_default_input_device_index())
+    for device in devices:
+        if classify_input_device(device)["is_builtin_mic"]:
+            add(int(device["index"]))
+            break
+    return candidates
+
+
 def find_preferred_input_device(
-    devices: list[dict], preferred_keywords: list[str] | None = None
+    devices: list[dict],
+    preferred_keywords: list[str] | None = None,
+    user_confirmed_index: int | None = None,
+    user_confirmed_name: str | None = None,
 ) -> tuple[dict | None, str]:
     """Choose a stable preferred input device without relying on its name at capture."""
     if not devices:
         return None, "没有可用输入设备"
     keywords = preferred_keywords or PREFERRED_INPUT_KEYWORDS
-    normalized = [(device, str(device["name"]).casefold()) for device in devices]
+    normalized = [(device, normalize_device_name(device["name"])) for device in devices]
+
+    if user_confirmed_index is not None:
+        for device, _ in normalized:
+            if int(device["index"]) == int(user_confirmed_index):
+                return device, "优先使用用户确认的 Wireless Mic Rx device index"
+    confirmed_name = normalize_device_name(user_confirmed_name)
+    if confirmed_name:
+        for device, name in normalized:
+            if name == confirmed_name:
+                return device, "原 index 已变化，按用户确认的设备名称重新匹配"
 
     for device, name in normalized:
         if name == "wireless mic rx":
@@ -147,18 +227,52 @@ def find_preferred_input_device(
     return devices[0], "使用第一个可用输入设备"
 
 
-def diagnose_audio_devices() -> dict:
+def diagnose_audio_devices(
+    selected_index: int | None = None,
+    selected_device_has_level: bool | None = None,
+    user_confirmed_index: int | None = None,
+    user_confirmed_name: str | None = None,
+) -> dict:
     """Collect a non-fatal PortAudio snapshot for the page and CLI diagnostics."""
     try:
         sd = _load_sounddevice()
         raw_devices = list(sd.query_devices())
         devices = list_audio_input_devices(force_refresh=True)
-        recommended, recommendation_reason = find_preferred_input_device(devices)
-        names = [str(device["name"]).casefold() for device in devices]
-        wireless_found = any("wireless mic rx" in name for name in names)
-        usb_codec_found = any("usb audio codec" in name for name in names)
+        recommended, recommendation_reason = find_preferred_input_device(
+            devices,
+            user_confirmed_index=user_confirmed_index,
+            user_confirmed_name=user_confirmed_name,
+        )
+        classifications = [classify_input_device(device) for device in devices]
+        exact_wireless_found = any(
+            item["is_exact_wireless_mic_rx"] for item in classifications
+        )
+        possible_wireless_found = any(
+            item["is_possible_wireless_receiver"] for item in classifications
+        )
+        usb_codec_found = any(item["is_usb_audio_codec"] for item in classifications)
+        selected_device = next(
+            (
+                device
+                for device in devices
+                if selected_index is not None and int(device["index"]) == int(selected_index)
+            ),
+            None,
+        )
+        selected_classification = classify_input_device(selected_device or "")
+        selected_available = selected_device is not None
+        if not exact_wireless_found and usb_codec_found:
+            recommendation_message = (
+                "macOS 声音设置中可能显示为 Wireless Mic Rx，但 PortAudio/sounddevice "
+                "中可能显示为 USB audio CODEC。若输入电平正常，可直接选择 USB audio "
+                "CODEC 进行采集。"
+            )
+        elif exact_wireless_found:
+            recommendation_message = "已发现名称包含 Wireless Mic Rx 的输入设备。"
+        else:
+            recommendation_message = "未发现明显的无线麦接收器名称，可刷新列表或检查 USB 连接。"
         suggestions: list[str] = []
-        if not wireless_found:
+        if not exact_wireless_found:
             suggestions = [
                 "点击“刷新麦克风列表”重新枚举设备。",
                 "重新插拔 USB 无线麦克风接收器。",
@@ -173,10 +287,21 @@ def diagnose_audio_devices() -> dict:
             "raw_device_count": len(raw_devices),
             "input_device_count": len(devices),
             "devices": devices,
-            "wireless_mic_rx_found": wireless_found,
+            "wireless_mic_rx_found": exact_wireless_found,
+            "found_exact_wireless_mic_rx": exact_wireless_found,
+            "found_possible_wireless_receiver": possible_wireless_found,
+            "found_usb_audio_codec": usb_codec_found,
             "usb_audio_codec_found": usb_codec_found,
+            "selected_device": selected_device,
+            "selected_device_available": selected_available,
+            "selected_device_classification": selected_classification,
+            "selected_is_possible_wireless_receiver": selected_classification[
+                "is_possible_wireless_receiver"
+            ],
+            "selected_device_has_level": selected_device_has_level,
             "recommended_device": recommended,
             "recommendation_reason": recommendation_reason,
+            "recommendation_message": recommendation_message,
             "suggestions": suggestions,
             "error": "",
         }
@@ -190,9 +315,18 @@ def diagnose_audio_devices() -> dict:
             "input_device_count": 0,
             "devices": [],
             "wireless_mic_rx_found": False,
+            "found_exact_wireless_mic_rx": False,
+            "found_possible_wireless_receiver": False,
+            "found_usb_audio_codec": False,
             "usb_audio_codec_found": False,
+            "selected_device": None,
+            "selected_device_available": False,
+            "selected_device_classification": classify_input_device(""),
+            "selected_is_possible_wireless_receiver": False,
+            "selected_device_has_level": selected_device_has_level,
             "recommended_device": None,
             "recommendation_reason": "",
+            "recommendation_message": "无法完成音频设备诊断。",
             "suggestions": [],
             "error": str(exc),
         }
@@ -235,6 +369,8 @@ def check_audio_input_device(device_index: int | None = None) -> dict:
             "sample_rate": sample_rate,
             "samplerate": sample_rate,
             "channels": channels,
+            "max_input_channels": int(device["max_input_channels"]),
+            "default_samplerate": float(device["default_samplerate"]),
         }
     except Exception as exc:
         label = "默认麦克风" if device_index is None else f"麦克风 index={device_index}"
@@ -265,14 +401,22 @@ def test_audio_input_device(
         device = check_audio_input_device(device_index)
         rate = int(sample_rate or device["sample_rate"])
         frame_count = max(1, int(rate * duration))
-        recording = sd.rec(
-            frame_count,
-            samplerate=rate,
-            channels=1,
-            dtype="float32",
-            device=device["index"],
-        )
-        sd.wait()
+        stream = None
+        try:
+            stream = sd.InputStream(
+                samplerate=rate,
+                channels=1,
+                dtype="float32",
+                device=device["index"],
+            )
+            stream.start()
+            recording, _ = stream.read(frame_count)
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop()
+                finally:
+                    stream.close()
         rms, dbfs, peak, _ = _audio_stats(recording)
         return {
             "ok": True,
@@ -307,18 +451,25 @@ def measure_audio_input_level(
     device = check_audio_input_device(device_index)
     sample_rate = int(device["sample_rate"])
     frame_count = max(1, int(sample_rate * duration_sec))
+    stream = None
     try:
-        recording = sd.rec(
-            frame_count,
+        stream = sd.InputStream(
             samplerate=sample_rate,
             channels=1,
             dtype="float32",
-            device=device_index,
+            device=device["index"],
         )
-        sd.wait()
+        stream.start()
+        recording, _ = stream.read(frame_count)
     except Exception as exc:
         label = "默认麦克风" if device_index is None else f"麦克风 index={device_index}"
         raise AudioDeviceError(f"{label}输入电平读取失败：{exc}") from exc
+    finally:
+        if "stream" in locals() and stream is not None:
+            try:
+                stream.stop()
+            finally:
+                stream.close()
 
     rms, dbfs, peak, meter = _audio_stats(recording)
     return {

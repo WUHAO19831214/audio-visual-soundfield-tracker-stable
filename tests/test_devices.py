@@ -146,9 +146,9 @@ def test_audio_input_test_returns_error_instead_of_raising(monkeypatch) -> None:
         def check_input_settings(**kwargs):
             pass
 
-        @staticmethod
-        def rec(*args, **kwargs):
-            raise RuntimeError("input busy")
+        class InputStream:
+            def __init__(self, **kwargs):
+                raise RuntimeError("input busy")
 
     monkeypatch.setattr(audio_devices, "_load_sounddevice", lambda: FakeSoundDevice())
 
@@ -188,6 +188,58 @@ def test_preferred_device_falls_back_to_usb_audio_codec() -> None:
 
     assert device["index"] == 3
     assert "USB audio CODEC" in reason
+
+
+def test_classify_exact_wireless_mic_rx() -> None:
+    classification = audio_devices.classify_input_device(
+        {"name": "  Wireless   Mic Rx 8S2 "}
+    )
+
+    assert classification["is_exact_wireless_mic_rx"] is True
+    assert classification["is_possible_wireless_receiver"] is True
+    assert classification["friendly_type"] == "Wireless Mic Rx（精确名称）"
+
+
+def test_classify_usb_audio_codec_as_possible_wireless_receiver() -> None:
+    classification = audio_devices.classify_input_device(
+        {"name": "USB audio CODEC"}
+    )
+
+    assert classification["is_exact_wireless_mic_rx"] is False
+    assert classification["is_usb_audio_codec"] is True
+    assert classification["is_possible_wireless_receiver"] is True
+
+
+def test_user_confirmed_wireless_index_has_priority() -> None:
+    devices = [
+        {"index": 1, "name": "Wireless Mic Rx", "is_default": True},
+        {"index": 3, "name": "USB audio CODEC", "is_default": False},
+    ]
+
+    device, reason = audio_devices.find_preferred_input_device(
+        devices,
+        user_confirmed_index=3,
+        user_confirmed_name="USB audio CODEC",
+    )
+
+    assert device["index"] == 3
+    assert "用户确认" in reason
+
+
+def test_user_confirmed_wireless_name_rematches_after_index_change() -> None:
+    devices = [
+        {"index": 1, "name": "MacBook Air麦克风", "is_default": True},
+        {"index": 7, "name": "USB audio CODEC", "is_default": False},
+    ]
+
+    device, reason = audio_devices.find_preferred_input_device(
+        devices,
+        user_confirmed_index=3,
+        user_confirmed_name="USB audio CODEC",
+    )
+
+    assert device["index"] == 7
+    assert "重新匹配" in reason
 
 
 def test_device_enumeration_skips_one_malformed_device(monkeypatch) -> None:
