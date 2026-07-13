@@ -1,5 +1,7 @@
 # 视觉—声音同步采集：稳定基线
 
+本仓库是稳定可复现基线，不是日常开发主线。开发版见 [audio-visual-soundfield-tracker](https://github.com/WUHAO19831214/audio-visual-soundfield-tracker)。
+
 本仓库是 `audio-visual-soundfield-tracker` 的**稳定基线版本**，用于复现实验、课堂演示和故障回退。它不是开发仓库的镜像，也不会自动包含开发版中的双摄与三维实验功能。
 
 ## 基线身份
