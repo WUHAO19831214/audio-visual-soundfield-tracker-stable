@@ -1,25 +1,51 @@
-# 视觉—声音同步采集与空间声场分析系统
+# 视觉—声音同步采集：稳定基线
 
-这是一个完全本地运行的 Python/Streamlit 实验原型。当前版本保留图片计数、视频计数、摄像头实时计数和轨迹 CSV，并新增第 3 阶段的“视觉—音频同步采集”：追踪主 person 的图像位置，同时以 0.1 秒为周期提取麦克风特征，按统一时间戳融合并生成空间分布图。
+本仓库是 `audio-visual-soundfield-tracker` 的**稳定基线版本**，用于复现实验、课堂演示和故障回退。它不是开发仓库的镜像，也不会自动包含开发版中的双摄与三维实验功能。
 
-## 功能
+## 基线身份
 
-- 图片 person 计数与标注。
-- 视频 person 计数、主目标轨迹记录、标注视频、带轨迹视频、轨迹 PNG 和 CSV 导出。
-- 摄像头实时 person 计数与持续 `track_id`。
-- 摄像头和麦克风同步采集。
-- 实时显示主 `track_id`、`center_x/center_y`、相对 dB 和主频。
-- 停止后导出视觉、音频和融合 CSV。
-- 生成运动轨迹图、空间声强图、空间主频图，以及声学指标沿视觉轨迹的数值/颜色图。
-- 优先使用本地 YOLOv8 权重，视频和实时模式使用 ByteTrack；只有 YOLO 不可用时才回退到 OpenCV HOG。
-- 两种实时采集通路：浏览器 WebRTC，以及 OpenCV 摄像头 + sounddevice 麦克风。
+| 项目 | 记录 |
+| --- | --- |
+| 稳定仓库 commit | `6c5c6b7ca23155db58b63794993322fbdeb8f868` |
+| 对应开发仓库 commit | `6c5c6b7ca23155db58b63794993322fbdeb8f868` |
+| 基线日期 | 2026-07-11 |
+| 最后验证日期 | 2026-07-13 |
+| 验证计算机 | MacBook Air (M2, 16 GB) |
+| 验证操作系统 | macOS 26.3.1 (Build 25D2128) |
+| 自动验证 | `compileall` 通过；`pytest -q` 为 64 passed |
+
+完整的版本边界、设备说明和复现命令见 [STABLE_BASELINE.md](STABLE_BASELINE.md)。
+
+## 已纳入的稳定功能
+
+- 图片与视频 person 计数、标注和轨迹导出；
+- 单摄像头实时 person 计数，YOLOv8 + ByteTrack 优先，OpenCV HOG 回退；
+- 单摄像头视觉—音频同步采集；
+- 浏览器 WebRTC 摄像头和 OpenCV 本机摄像头两条采集路径；
+- `sounddevice` 麦克风枚举、输入测试与诊断；
+- person、指定物体模板、HSV 网球标记三种追踪方式；
+- RMS、相对 dBFS、主频、频谱质心和过零率；
+- visual/audio/fused CSV、二维轨迹图和图像平面声学分布图。
+
+## 明确不包含
+
+本稳定基线不包含开发版在后续提交中加入的：
+
+- 双摄像头实验模式和双摄启动预热/重试；
+- 双摄虚拟三维轨迹；
+- 交互式 Plotly 三维视角及三维声学叠加；
+- 棋盘格双目标定、极线校正和米制三角测量；
+- `virtual_*`、`world_*_m` 等双摄 CSV 字段。
+
+如需要这些功能，请使用开发仓库并明确记录所用 commit；不要把开发版 README 复制到本仓库。
 
 ## 安装与启动
 
-推荐 Python 3.11 至 3.12。Apple Silicon macOS 应使用原生 ARM64 Python，以便直接安装 PyAV 二进制包。
+推荐 Python 3.11–3.12，Apple Silicon 使用 ARM64 Python：
 
 ```bash
-cd /Users/wuhao/LocalProjects/Codex/macbookair/audio-visual-soundfield-tracker
+git clone https://github.com/WUHAO19831214/audio-visual-soundfield-tracker-stable.git
+cd audio-visual-soundfield-tracker-stable
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -27,264 +53,32 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-浏览器打开终端给出的本地地址，通常是 `http://localhost:8501`。第一次访问摄像头或麦克风时，macOS 和浏览器可能分别要求授权。所有结果保存在 `data/output/`，不接入云端或数据库。
+打开 `http://localhost:8501`。首次使用需允许终端/浏览器访问摄像头与麦克风。YOLO 权重放在 `models/yolov8n.pt`；没有权重时允许回退到 HOG。
 
-## 提高识别质量：启用 YOLO
-
-项目优先查找 `models/yolov8n.pt`，其次查找项目根目录下的 `yolov8n.pt`。找不到权重、未安装 `ultralytics` 或模型加载失败时才回退到 OpenCV HOG。
-
-```bash
-cd /Users/wuhao/LocalProjects/Codex/macbookair/audio-visual-soundfield-tracker
-source .venv/bin/activate
-pip install -U ultralytics
-mkdir -p models
-```
-
-将已有的 `yolov8n.pt` 放到：
-
-```text
-models/yolov8n.pt
-```
-
-也可以显式运行准备脚本。脚本会安装 Ultralytics、下载缺失权重并复制到 `models/`；应用本身不会静默下载模型：
-
-```bash
-./scripts/setup_yolo.sh
-```
-
-重新启动：
-
-```bash
-streamlit run app.py
-```
-
-侧边栏应显示：
-
-```text
-检测后端：YOLO
-YOLO 权重路径：.../models/yolov8n.pt
-Tracker：bytetrack.yaml
-```
-
-若仍显示 `OpenCV HOG`，侧边栏会同时给出缺少权重或加载失败原因。
-
-## 摄像头与麦克风选择
-
-### 两种采集方式
-
-页面按用途提供两条通路：
-
-- **浏览器摄像头 / 麦克风**：推荐用于 iPhone Continuity Camera，也支持 Mac 内置、USB 和虚拟摄像头。
-- **OpenCV 摄像头 + sounddevice 麦克风**：推荐用于固定设备的本地稳定实验。
-
-### OpenCV 本机摄像头
-
-“摄像头实时计数”和“视觉—音频同步采集”都可以选择 OpenCV 本机摄像头。页面提供：
-
-- 摄像头 index 0–5 下拉框；
-- 扫描本机摄像头按钮；
-- 读取单帧测试按钮；
-- 开始和停止按钮。
-
-macOS 上优先使用 `cv2.CAP_AVFOUNDATION`，失败后再尝试 OpenCV 默认后端。通常 Mac 内置摄像头是 index 0；iPhone Continuity Camera、USB 摄像头或虚拟摄像头可能是 1、2 或更高，具体以扫描和单帧预览为准。
-
-同步采集页面会列出 sounddevice 可见的输入设备。“默认麦克风”不传设备编号，由 macOS 默认输入决定；也可以明确选择外接麦克风。麦克风失败时页面会显示原因，但摄像头检测不会因此停止。
-
-### 麦克风设备无法显示 Wireless Mic Rx 时怎么办
-
-1. 先在 macOS“系统设置 → 声音 → 输入”确认 `Wireless Mic Rx` 已出现且有输入电平。
-2. 在同步采集页面点击“刷新麦克风列表”，它会重新调用 sounddevice/PortAudio 枚举，不使用页面旧列表。
-3. 如果仍未出现，重新插拔 USB 接收器后再次刷新；必要时重启 Streamlit。
-4. 如果页面只显示 `USB audio CODEC`，可以先选择并点击“测试当前麦克风 1 秒”。部分 USB 无线麦克风接收器会使用这个通用声卡名称。
-5. 展开“麦克风诊断”查看默认 input index、Wireless/USB CODEC 发现状态和推荐设备。只有测试返回 RMS、dBFS、peak 后再开始正式采集。
-
-也可以在终端查看完整诊断，不会保存测试录音：
+## 最小复现检查
 
 ```bash
 source .venv/bin/activate
-python scripts/diagnose_audio_devices.py
-```
-
-### 浏览器摄像头与设备选择
-
-第一次启动使用默认约束，不传递任何空 deviceId：
-
-```text
-video: { width: { ideal: 1280 }, height: { ideal: 720 } }
-audio: false
-```
-
-浏览器授权后，WebRTC 组件通过 `enumerateDevices()` 显示 `Select Device`。当前浏览器通路只负责摄像头；麦克风仍使用页面中的 sounddevice 设备选择器，并实时显示输入电平。只有浏览器返回了有效设备 ID 后才会使用该选择，不会构造 `deviceId: {exact: ""}`。页面还提供“重置浏览器设备选择”，用于清除已经断开或过期的设备 ID，然后重新从默认摄像头启动。
-
-浏览器设备列表由浏览器权限控制，Python 端无法直接读取。若列表为空：
-
-1. 使用最新版 Chrome 或 Safari；
-2. 确认页面地址为 `localhost`；
-3. 点击地址栏的摄像头权限并选择允许；
-4. 先允许默认摄像头成功启动，再刷新页面并打开 `Select Device`。
-
-## 使用 iPhone Continuity Camera
-
-1. Mac 和 iPhone 登录同一个 Apple ID。
-2. 打开两台设备的 Wi-Fi、蓝牙和接力。
-3. 将 iPhone 靠近 Mac；必要时锁定 iPhone 屏幕。
-4. 先在 FaceTime、Photo Booth 或其他应用中确认 iPhone 摄像头可用。
-5. 在本项目中优先选择“浏览器摄像头 / 麦克风”模式。
-6. 页面打开后先允许浏览器摄像头权限，让默认摄像头成功启动。
-7. 停止采集后点击 WebRTC 组件的 `Select Device`；如果列表中出现 iPhone 名称，选择该设备再启动。
-8. 如果设备列表仍没有 iPhone，检查浏览器地址栏权限，刷新页面，并确认 Continuity Camera 没有被其他应用占用。
-9. OpenCV index 扫描不到 iPhone 是正常情况，不代表 Continuity Camera 不可用；此时继续使用浏览器模式。
-
-### 测试默认摄像头和 OpenCV 兜底
-
-1. 在 macOS“系统设置 → 隐私与安全性”中允许终端或 Codex 使用摄像头和麦克风。
-2. 测试默认摄像头：选择 index 0，点击“测试摄像头并读取一帧”。
-3. 点击“扫描本机摄像头 0–5”，依次测试其他编号以寻找 USB 或虚拟摄像头。
-4. 如果 index 0 不可用，页面会显示错误，可改选其他 index，不会终止应用。
-
-## 同步采集实验流程
-
-1. 固定摄像头，确保实验区域完整入画，尽量避免明显背光。
-2. 连接并选择麦克风。为了稳定，应关闭系统自动增益、降噪和回声消除（若设备允许）。
-3. 在侧栏选择“视觉—音频同步采集”。iPhone 优先选择浏览器模式；固定外接设备可选择 OpenCV + sounddevice。
-4. 浏览器模式先授权再通过 `Select Device` 选择设备；OpenCV 模式则选择 index 和麦克风并运行采集前检查。
-5. 一个人手持或佩戴麦克风在画面内移动。只有一个 person 时自动选中；多人时优先选择持续时间较长且靠近画面中心的 `track_id`。绿色框和 `MAIN` 标签表示当前主目标。
-6. 页面实时查看 `track_id`、位置、相对 dB 和主频。建议至少采集 10 秒，并缓慢覆盖需要分析的区域。
-7. 点击“停止并生成结果”。系统自动导出融合 CSV，并生成轨迹、声强和主频三张图。
-8. 从页面下载结果，或直接查看 `data/output/`。
-
-## 固定机位声场轨迹实验
-
-固定机位实验推荐使用 “OpenCV 摄像头 + sounddevice 麦克风”。摄像头固定后，图像像素坐标可以作为相对空间坐标使用；人在画面内移动时，系统记录主 `track_id` 的中心点，并把最近的音频特征匹配到该位置。
-
-同步采集停止后，除原始轨迹、声强和主频空间图外，还会导出：
-
-- `capture_*_fused_trajectory_overlay.png`：融合后的视觉轨迹叠加图。
-- `capture_*_acoustic_trajectory_db_values.png`：沿轨迹标注相对声强数值。
-- `capture_*_acoustic_trajectory_db_colormap.png`：沿轨迹用颜色表示相对声强。
-- `capture_*_acoustic_trajectory_frequency_values.png`：沿轨迹标注主频数值。
-- `capture_*_acoustic_trajectory_frequency_colormap.png`：沿轨迹用颜色表示主频。
-- `capture_*_acoustic_trajectory_spectral_centroid_colormap.png`：沿轨迹用颜色表示频谱质心。
-
-声学轨迹图只使用 `matched=True` 且有像素坐标的数据行。数据为空或匹配点过少时，系统会生成带说明文字的占位 PNG，而不是让导出流程报错。当前同步采集尚未保存原始视频流，因此还不会生成“声学轨迹视频”；页面会明确提示这一限制。
-
-## 指定物体追踪模式
-
-“视觉—音频同步采集”默认仍使用 YOLO person。实验性的“指定物体”模式适合手持麦克风、小球、教具和标志物等单目标：先从当前 OpenCV 摄像头截取完整画面，或上传与采集相同机位的模板图，再通过 `x/y/width/height` 设置 ROI 并初始化 tracker。正式采集后，目标固定使用 `track_id=1` 和 `track_class=custom_object`，位置会与音频按同一时间戳融合，并继续生成融合 CSV、声强轨迹和频率轨迹图。
-
-系统按 CSRT、KCF、MIL 的顺序寻找当前 OpenCV 可用 tracker，并兼容 `cv2` 与 `cv2.legacy` API。若 CSRT/KCF 不可用会回退到 MIL；页面会显示实际 tracker。不要同时安装相互冲突的 `opencv-python` 与 `opencv-contrib-python`，若确实需要 CSRT/KCF，应先在单独环境评估 contrib 版本。
-
-当前 OpenCV 单目标 tracker 对遮挡、明显光照变化、快速旋转和大幅尺度变化较敏感。小物体建议贴明显颜色标记。更高阶方案可考虑 ArUco marker、SiamMask、OSTrack 或 Siamese-DETR，但这些不属于当前轻量实现。
-
-## 网球标记追踪模式
-
-“视觉—音频同步采集”默认仍是 YOLO person，也可以选择推荐的 `Tennis ball marker（网球标记追踪）`。该模式使用轻量的 HSV 颜色分割、形态学去噪、轮廓面积/圆度筛选和中心点平滑，不引入新的深度学习权重。它适合固定机位声场实验中的网球、手持标记物，或贴在麦克风附近的明显颜色标记。
-
-页面中可以直接使用默认黄绿色 HSV 阈值，也可以截取当前 OpenCV 摄像头画面或上传图片，再通过 `ROI x/y/width/height` 框定网球并自动估计 HSV。随后查看 mask 预览，点击“测试网球识别”，确认有 center、radius、area、circularity 后再点击“初始化网球追踪”。正式 START 后，系统记录网球中心点并与麦克风音频按时间戳融合。
-
-如果识别不稳，先调 H/S/V、面积和最小圆度，并观察 mask 是否只保留网球。网球应尽量保持在画面内，背景不要有大量相似黄绿色物体。该方法对光照、遮挡、球太小和背景相似颜色敏感；需要真实空间坐标时，后续可增加四角点标定和 perspective transform，将 `pixel_x/pixel_y` 转成 `real_x_m/real_y_m`。更高阶方案可考虑 ArUco marker 或专门训练的 tennis-ball YOLO。
-
-## 时间同步规则
-
-- `src/sync_clock.py` 用一个共享 `SyncClock` 为视觉帧和音频块生成时间戳。
-- 导出的 `timestamp` 是 Unix 秒；内部用 `time.perf_counter()` 保持会话内单调递增。
-- 视觉处理尽可能跟随输入帧率；实际帧率取决于检测后端和电脑性能。
-- 音频默认每 `0.1` 秒提取一次特征，即约 10 fps。
-- `src/fusion.py` 以每条音频记录为基准，使用二分查找寻找最近视觉帧。
-- 时间差不超过 `0.15` 秒时 `matched=True`；超过阈值或当时没有主目标时记为 `matched=False`，位置字段留空。
-- 未匹配音频仍保留在融合 CSV 中，便于检查丢帧和检测中断，而绘图只使用匹配成功的数据。
-
-## 融合 CSV 字段
-
-| 字段 | 含义 |
-| --- | --- |
-| `timestamp` | 音频块时间戳，Unix 秒 |
-| `matched` | 是否匹配到 0.15 秒以内的视觉帧 |
-| `time_diff_sec` | 最近视觉帧与音频块的绝对时间差 |
-| `track_id` | 主追踪对象 ID |
-| `center_x`, `center_y` | 检测框中心的图像像素坐标 |
-| `bbox_width`, `bbox_height` | 检测框像素宽高 |
-| `tracking_mode` | `person_yolo`、`tennis_ball_color` 或 `custom_object_template` |
-| `track_class` | `person`、`tennis_ball_marker` 或 `custom_object` |
-| `tracking_status` | 当前视觉样本是 `tracking` 还是 `lost` |
-| `marker_radius`, `marker_area`, `marker_circularity` | 网球颜色分割的几何结果；其他模式为空 |
-| `lost_frame_count` | 连续丢失帧数 |
-| `rms` | 音频均方根幅值 |
-| `db` | 相对数字满刻度声强，dBFS |
-| `dominant_frequency_hz` | FFT 最大非直流分量的频率 |
-| `spectral_centroid_hz` | 频谱质心 |
-| `zero_crossing_rate` | 过零率 |
-
-## 输出文件
-
-每次同步采集停止后会生成：
-
-- `capture_*_visual.csv`：主目标视觉轨迹原始记录。
-- `capture_*_audio.csv`：0.1 秒音频特征原始记录。
-- `capture_*_fused.csv`：按音频时间戳融合后的数据。
-- `capture_*_fused_trajectory.png`：位置轨迹。
-- `capture_*_fused_trajectory_overlay.png`：融合轨迹叠加图。
-- `capture_*_fused_sound_intensity.png`：空间相对声强分布。
-- `capture_*_fused_dominant_frequency.png`：空间主频分布。
-- `capture_*_acoustic_trajectory_db_values.png`：相对声强数值轨迹。
-- `capture_*_acoustic_trajectory_db_colormap.png`：相对声强颜色轨迹。
-- `capture_*_acoustic_trajectory_frequency_values.png`：主频数值轨迹。
-- `capture_*_acoustic_trajectory_frequency_colormap.png`：主频颜色轨迹。
-- `capture_*_acoustic_trajectory_spectral_centroid_colormap.png`：频谱质心颜色轨迹。
-
-视频模式另行生成标注 MP4、可选带轨迹 MP4、轨迹叠加 PNG、空白背景轨迹 PNG 和主目标轨迹 CSV。
-
-## RF-DETR 可选对比
-
-当前项目仍以 YOLOv8 + ByteTrack 为主检测后端，不把 RF-DETR 加入默认依赖，也不替换现有检测流程。若要确认当前环境是否已经安装 RF-DETR 相关包，可运行：
-
-```bash
-python3 scripts/check_rfdetr_available.py
-```
-
-如果脚本显示未安装，这是正常状态。RF-DETR 更适合后续作为单独分支或离线对比实验加入，避免影响当前 YOLO 复现实验的稳定性。
-
-## 实验边界与注意事项
-
-1. 第一版记录的是摄像头图像平面坐标，不是真实空间坐标。坐标原点在图像左上角，`x` 向右、`y` 向下；绘图时会翻转 y 轴以保持直观。
-2. 若需要真实空间坐标，后续需要加入标定板或 ArUco marker，完成透视校正和像素到实际长度的转换。
-3. 当前 `db` 是根据数字音频幅值计算的相对声强（dBFS），不是经过声级计校准的绝对声压级 dB SPL。浏览器或操作系统的自动增益也可能改变结果。
-4. 若要获得更准确的声场，应使用频响稳定的外接麦克风，固定输入增益，并使用声级计或校准器进行声学校准。
-5. 摄像头应固定不动；镜头移动会让图像坐标失去统一空间参考。
-
-## Good-Pickleball 对本轮改造的启发
-
-参考项目 [Good-Pickleball](https://github.com/yo-WASSUP/Good-Pickleball) 的价值主要在于把球检测、球员/小球轨迹、轨迹导出、实验区域标定和坐标映射组织成完整流程。它 README 中还展示了球场四角点标定、标准场地坐标和像素到场地位置的后续方向。本轮只借鉴这些数据组织和可视化思路，采用本项目自己的 HSV 颜色追踪，不直接复制代码，也不引入其 `tennis-ball.pt` 或其他大型模型权重。
-6. 当前系统适合课堂实验原型、相对分布分析和教学演示，不适合作为法定计量或工程验收设备。
-
-## 测试
-
-```bash
-source .venv/bin/activate
-python -m pip install pytest
+python -m compileall app.py src tests
 pytest -q
+streamlit run app.py
+curl -I http://localhost:8501
 ```
 
-自动测试覆盖 YOLO/HOG 后端选择、设备枚举失败处理、Streamlit 同步采集页面、0.1 秒音频分块、0.15 秒融合阈值、主目标选择和三类图像导出。真实摄像头、Continuity Camera 与麦克风权限仍需在本机人工验收。
+HTTP 200 仅说明服务可访问；摄像头、麦克风和具体实验仍须在目标设备上单独验证。
 
-## 代码结构
+## 数据与物理含义
 
-```text
-app.py                         Streamlit 页面和 WebRTC 处理器
-src/browser_capture.py         按需加载的 WebRTC/PyAV 处理器
-src/sync_clock.py              视觉/音频共享时钟
-src/config.py                  模型、输出目录和默认检测配置
-src/detector.py                YOLO 优先检测、ByteTrack 与 HOG 回退
-src/camera_processor.py        track_id 历史、主目标选择和画面标注
-src/camera_devices.py          OpenCV/AVFoundation 摄像头枚举
-src/audio_devices.py           sounddevice 麦克风枚举
-src/local_capture.py           本机摄像头和麦克风后台采集线程
-src/audio_recorder.py          音频缓冲和 0.1 秒分块
-src/audio_features.py          RMS、dB、主频、频谱质心、过零率
-src/fusion.py                  最近时间戳匹配和会话导出
-src/soundfield_visualizer.py   轨迹、声强、主频空间图
-src/trajectory_visualizer.py   视频与融合轨迹叠加图
-src/acoustic_trajectory_visualizer.py  声学指标沿视觉轨迹绘图
-src/csv_logger.py              CSV 写入工具
-tests/                         可重复的自动测试
-```
+- `center_x/center_y` 是图像像素坐标，不是实际米制坐标。
+- `rms` 是归一化 PCM 的均方根幅值；`db` 是 dBFS，不是 dB SPL。
+- 融合以音频时间戳为基准，寻找 0.15 秒内最近的有效视觉帧。
+- 连续声场色块来自实测匹配点之间的三角剖分插值；散点才是实测位置。
+- 摄像头必须固定；若麦克风不随测点移动，图只表示位置与固定麦克风读数的关联。
+
+## 输出
+
+同步采集会在 `data/output/` 生成 `capture_*_visual.csv`、`*_audio.csv`、`*_fused.csv`、summary JSON 及二维轨迹/声学 PNG。原始采集数据、视频、音频、图片和模型权重不应提交到 Git。
+
+## 维护原则
+
+只有经过明确验证的开发仓库 commit/tag 才能升级为新稳定基线。升级时必须同步更新 `STABLE_BASELINE.md` 中的来源版本、验证日期、设备、测试结果、样例数据说明和开发版差异。
