@@ -6,6 +6,9 @@
 - 稳定 commit：`6c5c6b7ca23155db58b63794993322fbdeb8f868`
 - 来源开发仓库：`WUHAO19831214/audio-visual-soundfield-tracker`
 - 对应开发 commit：`6c5c6b7ca23155db58b63794993322fbdeb8f868`
+- 基线版本标识：`stable-baseline-2026-07-11`（文档标识，不是 Git tag）
+- 对应开发 tag：尚未创建；当前以完整 commit SHA 为唯一版本锚点
+- 同步日期：2026-07-11
 - 来源提交说明：`Stabilize audio runtime and marker tracking`
 - 最后验证日期：2026-07-13
 

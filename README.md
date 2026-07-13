@@ -8,6 +8,8 @@
 | --- | --- |
 | 稳定仓库 commit | `6c5c6b7ca23155db58b63794993322fbdeb8f868` |
 | 对应开发仓库 commit | `6c5c6b7ca23155db58b63794993322fbdeb8f868` |
+| 基线版本标识 | `stable-baseline-2026-07-11`（文档标识，不是 Git tag） |
+| 对应 Git tag | 尚未创建；当前以完整 commit SHA 为唯一版本锚点 |
 | 基线日期 | 2026-07-11 |
 | 最后验证日期 | 2026-07-13 |
 | 验证计算机 | MacBook Air (M2, 16 GB) |
